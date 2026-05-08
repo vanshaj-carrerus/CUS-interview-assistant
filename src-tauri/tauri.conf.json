@@ -12,11 +12,12 @@
   "app": {
     "windows": [
       {
-        "title": "AI Assistant",
-        "width": 400,
-        "height": 300,
+        "title": "CUS Interview Assistant",
+        "width": 600,
+        "height": 600,
         "resizable": true,
         "fullscreen": false,
+        "skipTaskbar": false,
         "transparent": true,
         "alwaysOnTop": false,
         "decorations": true,
