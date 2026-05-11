@@ -2,14 +2,24 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
+import {
+  buildInterviewCoachPrompt,
+  coerceInterviewCoachJson,
+  formatInterviewCoachJson,
+  runMockInterviewPrompt,
+} from "./lib/interviewAiEngine";
 
 type TranscriptPayload = {
   text: string;
   is_final: boolean;
 };
 
-const DEFAULT_AI_PLACEHOLDER =
-  "Click 'Send To AI' after you capture the recruiter question.";
+type ChatMessage = {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+  model?: string;
+};
 
 function App() {
   const [isListening, setIsListening] = useState(false);
@@ -17,7 +27,7 @@ function App() {
   const [captureMode, setCaptureMode] = useState("Idle");
   const [transcript, setTranscript] = useState("");
   const [partialTranscript, setPartialTranscript] = useState("");
-  const [aiResponse, setAiResponse] = useState(DEFAULT_AI_PLACEHOLDER);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [errorMessage, setErrorMessage] = useState("");
 
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -53,7 +63,7 @@ function App() {
     const node = scrollRef.current;
     if (!node) return;
     node.scrollTo({ top: node.scrollHeight, behavior: "smooth" });
-  }, [transcript, partialTranscript, aiResponse, isSending]);
+  }, [transcript, partialTranscript, chatMessages, isSending]);
 
   const startListening = async () => {
     try {
@@ -80,29 +90,53 @@ function App() {
   const clearTranscript = () => {
     setTranscript("");
     setPartialTranscript("");
-    setAiResponse(DEFAULT_AI_PLACEHOLDER);
+    setChatMessages([]);
     setErrorMessage("");
     console.log("[Transcript Cleared]");
   };
 
   const sendToAi = async () => {
-    const cleanTranscript = transcript.trim();
-    if (!cleanTranscript) {
-      setErrorMessage("Capture some speech first, then send it to AI.");
+    const snapshot = `${transcript}${partialTranscript ? ` ${partialTranscript}` : ""}`.trim();
+    if (!snapshot) {
+      setErrorMessage(
+        "Add what the recruiter said (listen, type, or paste), then send to AI.",
+      );
       return;
     }
+    setErrorMessage("");
+    const userId = crypto.randomUUID();
+    setChatMessages((prev) => [...prev, { id: userId, role: "user", content: snapshot }]);
+    setTranscript("");
+    setPartialTranscript("");
     setIsSending(true);
-    const mockedAnswer = `AI Draft Answer:\n- Key question heard: "${cleanTranscript.slice(0, 180)}${cleanTranscript.length > 180 ? "..." : ""}"\n- Suggested response: Highlight your approach, tools, impact, and one concrete example.`;
-    await new Promise((resolve) => setTimeout(resolve, 450));
-    setAiResponse(mockedAnswer);
-    setIsSending(false);
-    console.log("[Send To AI]", cleanTranscript);
+    try {
+      const prompt = buildInterviewCoachPrompt(snapshot);
+      const { data, model } = await runMockInterviewPrompt<unknown>(prompt);
+      const coach = coerceInterviewCoachJson(data);
+      const assistantText = formatInterviewCoachJson(coach);
+      setChatMessages((prev) => [
+        ...prev,
+        {
+          id: crypto.randomUUID(),
+          role: "assistant",
+          content: assistantText,
+          model,
+        },
+      ]);
+      console.log("[Send To AI]", snapshot, model);
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "AI request failed. Check API keys in .env.";
+      setErrorMessage(message);
+      console.error("[Send To AI]", err);
+    } finally {
+      setIsSending(false);
+    }
   };
 
   const hasTranscript =
     transcript.trim().length > 0 || partialTranscript.trim().length > 0;
-  const hasAiResponse = aiResponse !== DEFAULT_AI_PLACEHOLDER;
-  const showEmptyState = !hasTranscript && !hasAiResponse;
+  const showEmptyState = chatMessages.length === 0 && !hasTranscript;
 
   const composedTranscript = useMemo(
     () => `${transcript}${partialTranscript ? ` ${partialTranscript}` : ""}`.trim(),
@@ -110,7 +144,7 @@ function App() {
   );
 
   return (
-    <div className="flex h-screen w-screen flex-col overflow-hidden text-slate-100">
+    <div className="flex h-full max-h-[calc(100vh-30px)] w-full flex-col overflow-hidden text-slate-100">
       <Header isListening={isListening} captureMode={captureMode} />
 
       <main className="relative flex-1 overflow-hidden">
@@ -121,20 +155,32 @@ function App() {
           <div className="mx-auto flex max-w-3xl flex-col gap-4">
             {showEmptyState && <EmptyState />}
 
-            {hasTranscript && (
-              <UserBubble
-                value={composedTranscript}
-                isPartialActive={partialTranscript.length > 0}
-                onChange={(next) => {
-                  setTranscript(next);
-                  setPartialTranscript("");
-                }}
-              />
+            {chatMessages.map((msg) =>
+              msg.role === "user" ? (
+                <UserBubble
+                  key={msg.id}
+                  value={msg.content}
+                  readOnly
+                  isPartialActive={false}
+                  onChange={() => {}}
+                />
+              ) : (
+                <AiBubble key={msg.id} text={msg.content} model={msg.model} />
+              ),
             )}
 
             {isSending && <TypingBubble />}
 
-            {hasAiResponse && !isSending && <AiBubble text={aiResponse} />}
+            <UserBubble
+              value={composedTranscript}
+              readOnly={false}
+              isPartialActive={partialTranscript.length > 0}
+              placeholder="Live transcript appears here while listening. If capture is not working, type or paste what you heard, then Send to AI."
+              onChange={(next) => {
+                setTranscript(next);
+                setPartialTranscript("");
+              }}
+            />
           </div>
         </div>
       </main>
@@ -149,7 +195,7 @@ function App() {
       <Composer
         isListening={isListening}
         isSending={isSending}
-        canSend={transcript.trim().length > 0}
+        canSend={composedTranscript.trim().length > 0}
         onStart={startListening}
         onStop={stopListening}
         onSend={sendToAi}
@@ -169,7 +215,7 @@ function Header({
   return (
     <header className="flex shrink-0 items-center justify-between gap-3 border-b border-white/5 bg-surface/40 px-4 py-3 backdrop-blur-md">
       <div className="flex min-w-0 items-center gap-3">
-        <div className="relative grid size-9 shrink-0 place-items-center rounded-xl bg-gradient-to-br from-primary to-secondary shadow-lg shadow-primary/25">
+        <div className="relative grid size-9 shrink-0 place-items-center rounded-xl bg-linear-to-br from-primary to-secondary shadow-lg shadow-primary/25">
           <SparkleIcon className="size-5 text-white" />
         </div>
         <div className="min-w-0">
@@ -209,20 +255,24 @@ function Header({
 function EmptyState() {
   return (
     <div className="mt-6 flex flex-col items-center gap-3 text-center">
-      <div className="grid size-14 place-items-center rounded-2xl bg-gradient-to-br from-primary/20 to-secondary/20 ring-1 ring-white/10">
+      <div className="grid size-14 place-items-center rounded-2xl bg-linear-to-br from-primary/20 to-secondary/20 ring-1 ring-white/10">
         <SparkleIcon className="size-7 text-primary" />
       </div>
       <div>
         <h2 className="text-base font-semibold text-white">
           Ready when you are
         </h2>
-        <p className="mt-1 max-w-xs text-[13px] leading-relaxed text-slate-400">
-          Hit{" "}
+        <p className="mt-1 max-w-sm text-[13px] leading-relaxed text-slate-400">
+          Use{" "}
           <span className="rounded bg-white/5 px-1.5 py-0.5 text-slate-200">
-            Start Listening
+            Listen
           </span>{" "}
-          to capture system audio. Your live transcript and AI-drafted answer
-          will appear here.
+          to capture system audio, or type or paste the recruiter question in
+          the box below if transcription is unavailable. Then use{" "}
+          <span className="rounded bg-white/5 px-1.5 py-0.5 text-slate-200">
+            Send to AI
+          </span>{" "}
+          for a drafted answer.
         </p>
       </div>
     </div>
@@ -231,12 +281,16 @@ function EmptyState() {
 
 function UserBubble({
   value,
+  readOnly,
   isPartialActive,
   onChange,
+  placeholder = "Transcript will appear here…",
 }: {
   value: string;
+  readOnly?: boolean;
   isPartialActive: boolean;
   onChange: (next: string) => void;
+  placeholder?: string;
 }) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
@@ -253,25 +307,31 @@ function UserBubble({
         <div className="flex items-center gap-2 pr-1 text-[11px] text-slate-400">
           {isPartialActive && (
             <span className="inline-flex items-center gap-1 text-emerald-300/80">
-              <span className="listening-dot !size-1.5" />
+              <span className="listening-dot size-1.5!" />
               capturing…
             </span>
           )}
-          <span>You</span>
+          <span>{readOnly ? "You · sent" : "You"}</span>
           <div className="grid size-6 place-items-center rounded-full bg-white/10 text-[10px] font-semibold text-slate-200">
             U
           </div>
         </div>
-        <div className="group rounded-2xl rounded-tr-sm bg-gradient-to-br from-primary/25 to-primary/10 p-px shadow-lg shadow-primary/10 ring-1 ring-primary/30">
-          <textarea
-            ref={textareaRef}
-            value={value}
-            onChange={(e) => onChange(e.currentTarget.value)}
-            placeholder="Transcript will appear here..."
-            spellCheck={false}
-            className="block w-full resize-none rounded-2xl rounded-tr-sm bg-surface-2/80 px-4 py-3 text-[14px] leading-relaxed text-slate-100 placeholder:text-slate-500 focus:outline-none"
-            rows={1}
-          />
+        <div className="group rounded-2xl rounded-tr-sm bg-linear-to-br from-primary/25 to-primary/10 p-px shadow-lg shadow-primary/10 ring-1 ring-primary/30">
+          {readOnly ? (
+            <p className="max-h-60 overflow-y-auto whitespace-pre-wrap rounded-2xl rounded-tr-sm bg-surface-2/80 px-4 py-3 text-[14px] leading-relaxed text-slate-100">
+              {value}
+            </p>
+          ) : (
+            <textarea
+              ref={textareaRef}
+              value={value}
+              onChange={(e) => onChange(e.currentTarget.value)}
+              placeholder={placeholder}
+              spellCheck={false}
+              rows={3}
+              className="block min-h-[5.5rem] w-full resize-y rounded-2xl rounded-tr-sm bg-surface-2/80 px-4 py-3 text-[14px] leading-relaxed text-slate-100 placeholder:text-slate-500 focus:outline-none"
+            />
+          )}
         </div>
       </div>
     </div>
@@ -283,7 +343,7 @@ function TypingBubble() {
     <div className="flex justify-start">
       <div className="flex max-w-[88%] flex-col items-start gap-1">
         <div className="flex items-center gap-2 pl-1 text-[11px] text-slate-400">
-          <div className="grid size-6 place-items-center rounded-full bg-gradient-to-br from-primary to-secondary text-[10px] font-bold text-white">
+          <div className="grid size-6 place-items-center rounded-full bg-linear-to-br from-primary to-secondary text-[10px] font-bold text-white">
             <SparkleIcon className="size-3" />
           </div>
           <span>Assistant</span>
@@ -300,18 +360,24 @@ function TypingBubble() {
   );
 }
 
-function AiBubble({ text }: { text: string }) {
+function AiBubble({ text, model }: { text: string; model?: string }) {
+  const body = text.trim() ? text : "(No text in AI response.)";
   return (
-    <div className="flex justify-start">
-      <div className="flex max-w-[88%] flex-col items-start gap-1">
-        <div className="flex items-center gap-2 pl-1 text-[11px] text-slate-400">
-          <div className="grid size-6 place-items-center rounded-full bg-gradient-to-br from-primary to-secondary text-[10px] font-bold text-white">
+    <div className="flex w-full min-w-0 justify-start">
+      <div className="flex max-w-[88%] min-w-0 flex-col items-start gap-1">
+        <div className="flex flex-wrap items-center gap-2 pl-1 text-[11px] text-slate-400">
+          <div className="grid size-6 place-items-center rounded-full bg-linear-to-br from-primary to-secondary text-[10px] font-bold text-white"> 
             <SparkleIcon className="size-3" />
           </div>
           <span>Assistant</span>
         </div>
-        <div className="rounded-2xl rounded-tl-sm border border-white/5 bg-surface-2/70 px-4 py-3 text-[14px] leading-relaxed text-slate-100 shadow-lg shadow-black/20 backdrop-blur">
-          <p className="whitespace-pre-wrap">{text}</p>
+        <div className="w-full min-w-0 rounded-2xl rounded-tl-sm border border-white/5 bg-surface-2/70 px-4 py-3 text-[14px] leading-relaxed text-slate-100 shadow-lg shadow-black/20 backdrop-blur">
+          <p
+            className="whitespace-pre-wrap wrap-break-word text-slate-100"
+            aria-live="polite"
+          >
+            {body}
+          </p>
         </div>
       </div>
     </div>
@@ -400,7 +466,7 @@ function Composer({
           type="button"
           onClick={onSend}
           disabled={isSending || !canSend}
-          className="group inline-flex items-center gap-2 rounded-full bg-gradient-to-br from-primary to-secondary px-4 py-2 text-[13px] font-semibold text-primary-foreground shadow-lg shadow-primary/25 transition hover:brightness-110 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-50 disabled:shadow-none disabled:hover:brightness-100"
+          className="group inline-flex items-center gap-2 rounded-full bg-linear-to-br from-primary to-secondary px-4 py-2 text-[13px] font-semibold text-primary-foreground shadow-lg shadow-primary/25 transition hover:brightness-110 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-50 disabled:shadow-none disabled:hover:brightness-100"
         >
           {isSending ? (
             <>

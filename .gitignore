@@ -12,6 +12,12 @@ dist
 dist-ssr
 *.local
 
+# Env files (API keys) — never commit
+.env
+.env.*
+!.env.example
+src-tauri/.env
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
