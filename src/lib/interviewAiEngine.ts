@@ -111,30 +111,29 @@ export function coerceInterviewCoachJson(data: unknown): InterviewCoachJson {
 }
 
 
-async function tryGemini<T>(prompt: string): Promise<EngineResult<T>> {
+async function tryGemini<T>(prompt: string): Promise<EngineResult<T> | null> {
   const key = env("VITE_GEMINI_API_KEY");
-  if (!key) {
-    throw new Error("VITE_GEMINI_API_KEY is not set in .env");
+  if (!key) return null;
+  try {
+    const genAI = new GoogleGenerativeAI(key);
+    const model = genAI.getGenerativeModel({
+      model: "gemini-2.0-flash",
+      generationConfig: { responseMimeType: "application/json" },
+    });
+    const result = await model.generateContent(prompt);
+    const text = result.response.text();
+    return {
+      data: parseJsonSafely<T>(text),
+      model: "gemini-2.0-flash",
+    };
+  } catch {
+    return null;
   }
-  const genAI = new GoogleGenerativeAI(key);
-  const model = genAI.getGenerativeModel({
-    model: "gemini-2.0-flash",
-    generationConfig: { responseMimeType: "application/json" },
-  });
-  const result = await model.generateContent(prompt);
-  const text = result.response.text();
-  console.log("response text", text)
-  return {
-    data: parseJsonSafely<T>(text),
-    model: "gemini-2.0-flash",
-  };
 }
 
-async function tryGroqChain<T>(prompt: string): Promise<EngineResult<T>> {
+async function tryGroqChain<T>(prompt: string): Promise<EngineResult<T> | null> {
   const key = env("VITE_GROQ_API_KEY");
-  if (!key) {
-    throw new Error("VITE_GROQ_API_KEY is not set in .env");
-  }
+  if (!key) return null;
   const models = [
     "llama-3.3-70b-versatile",
     "mixtral-8x7b-32768",
@@ -170,14 +169,12 @@ async function tryGroqChain<T>(prompt: string): Promise<EngineResult<T>> {
       // try next provider model
     }
   }
-  throw new Error("Groq chain exhausted.");
+  return null;
 }
 
-async function tryMistralChain<T>(prompt: string): Promise<EngineResult<T>> {
+async function tryMistralChain<T>(prompt: string): Promise<EngineResult<T> | null> {
   const key = env("VITE_MISTRAL_API_KEY");
-  if (!key) {
-    throw new Error("VITE_MISTRAL_API_KEY is not set in .env");
-  }
+  if (!key) return null;
   const models = [
     "mistral-large-latest",
     "mistral-medium-latest",
@@ -214,14 +211,12 @@ async function tryMistralChain<T>(prompt: string): Promise<EngineResult<T>> {
     }
   }
 
-  throw new Error("Mistral chain exhausted.");
+  return null;
 }
 
-async function tryOpenRouter<T>(prompt: string): Promise<EngineResult<T>> {
+async function tryOpenRouter<T>(prompt: string): Promise<EngineResult<T> | null> {
   const key = env("VITE_OPENROUTER_API_KEY");
-  if (!key) {
-    throw new Error("VITE_OPENROUTER_API_KEY is not set in .env");
-  }
+  if (!key) return null;
   const models = [
     "google/gemma-4-26b-a4b-it:free",
     "google/gemma-4-31b-it:free",
@@ -256,26 +251,36 @@ async function tryOpenRouter<T>(prompt: string): Promise<EngineResult<T>> {
       // try next provider model
     }
   }
-  throw new Error("OpenRouter chain exhausted.");
+  return null;
 }
+
+const BACKEND_ORDER = ["Gemini", "Mistral", "Groq", "OpenRouter"] as const;
 
 export async function runMockInterviewPrompt<T>(
   prompt: string,
 ): Promise<EngineResult<T>> {
-  try {
-    return await tryGemini<T>(prompt);
-  } catch (geminiError) {
-    console.warn("Gemini failed, fallback to Mistral:", geminiError);
-    try {
-      return await tryMistralChain<T>(prompt);
-    } catch (mistralError) {
-      console.warn("Mistral failed, fallback to Groq:", mistralError);
-      try {
-        return await tryGroqChain<T>(prompt);
-      } catch (groqError) {
-        console.warn("Groq failed, fallback to OpenRouter:", groqError);
-        return tryOpenRouter<T>(prompt);
-      }
-    }
-  }
+  const tried: string[] = [];
+
+  const gemini = await tryGemini<T>(prompt);
+  if (gemini) return gemini;
+  tried.push(BACKEND_ORDER[0]);
+
+  const mistral = await tryMistralChain<T>(prompt);
+  if (mistral) return mistral;
+  tried.push(BACKEND_ORDER[1]);
+
+  const groq = await tryGroqChain<T>(prompt);
+  if (groq) return groq;
+  tried.push(BACKEND_ORDER[2]);
+
+  const openRouter = await tryOpenRouter<T>(prompt);
+  if (openRouter) return openRouter;
+  tried.push(BACKEND_ORDER[3]);
+
+  throw new Error(
+    "All interview AI backends failed or are unavailable. " +
+      "Set at least one of VITE_GEMINI_API_KEY, VITE_MISTRAL_API_KEY, VITE_GROQ_API_KEY, VITE_OPENROUTER_API_KEY in .env, " +
+      "then check quotas and network. " +
+      `(Attempted in order: ${tried.join(" → ")}.)`,
+  );
 }
