@@ -329,7 +329,7 @@ function UserBubble({
               placeholder={placeholder}
               spellCheck={false}
               rows={3}
-              className="block min-h-[5.5rem] w-full resize-y rounded-2xl rounded-tr-sm bg-surface-2/80 px-4 py-3 text-[14px] leading-relaxed text-slate-100 placeholder:text-slate-500 focus:outline-none"
+              className="block min-h-22 w-full resize-y rounded-2xl rounded-tr-sm bg-surface-2/80 px-4 py-3 text-[14px] leading-relaxed text-slate-100 placeholder:text-slate-500 focus:outline-none"
             />
           )}
         </div>
@@ -360,7 +360,7 @@ function TypingBubble() {
   );
 }
 
-function AiBubble({ text, model }: { text: string; model?: string }) {
+function AiBubble({ text }: { text: string; model?: string }) {
   const body = text.trim() ? text : "(No text in AI response.)";
   return (
     <div className="flex w-full min-w-0 justify-start">
