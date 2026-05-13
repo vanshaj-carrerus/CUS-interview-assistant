@@ -10,10 +10,6 @@ jobs:
     permissions:
       contents: write
     runs-on: windows-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        args: ['']
 
     steps:
       - name: checkout
@@ -38,26 +34,35 @@ jobs:
       - name: install dependencies
         run: npm ci
 
-      - name: build frontend
-        run: npm run build
-
-      # Attach bundles to the tag that triggered this workflow. Using only
-      # v__VERSION__ from tauri.conf would upload to e.g. v0.1.0 while you
-      # pushed v0.0.1 — assets would appear on the wrong (or duplicate) release.
-      - name: build tauri app
-        uses: tauri-apps/tauri-action@v0
+      - name: build Tauri bundles
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           CARGO_BUILD_JOBS: 4
           RUSTFLAGS: '-C target-feature=+crt-static'
+        run: npm run tauri -- build
+
+      - name: list bundle outputs
+        shell: pwsh
+        run: |
+          $bundle = "src-tauri/target/release/bundle"
+          if (-not (Test-Path $bundle)) {
+            Write-Error "Missing $bundle — build did not produce installers."
+            exit 1
+          }
+          Get-ChildItem -Path $bundle -Recurse -File | ForEach-Object { $_.FullName }
+
+      - name: upload release assets
+        uses: softprops/action-gh-release@v2
         with:
-          projectPath: src-tauri
-          tagName: ${{ github.ref_name }}
-          releaseName: 'CUS Interview Assistant ${{ github.ref_name }}'
-          releaseBody: 'Automatic interview assistant update.'
-          releaseDraft: false
+          tag_name: ${{ github.ref_name }}
+          name: CUS Interview Assistant ${{ github.ref_name }}
+          body: Automatic interview assistant update.
+          draft: false
           prerelease: false
-          includeUpdaterJson: false
-          args: ${{ matrix.args }}
+          fail_on_unmatched_files: true
+          files: |
+            src-tauri/target/release/bundle/nsis/*-setup.exe
+            src-tauri/target/release/bundle/msi/*.msi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
