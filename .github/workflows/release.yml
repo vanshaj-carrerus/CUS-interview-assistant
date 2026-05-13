@@ -41,6 +41,9 @@ jobs:
       - name: build frontend
         run: npm run build
 
+      # Attach bundles to the tag that triggered this workflow. Using only
+      # v__VERSION__ from tauri.conf would upload to e.g. v0.1.0 while you
+      # pushed v0.0.1 — assets would appear on the wrong (or duplicate) release.
       - name: build tauri app
         uses: tauri-apps/tauri-action@v0
         env:
@@ -51,9 +54,10 @@ jobs:
           RUSTFLAGS: '-C target-feature=+crt-static'
         with:
           projectPath: src-tauri
-          tagName: v__VERSION__
-          releaseName: 'CUS Interview Assistant v__VERSION__'
+          tagName: ${{ github.ref_name }}
+          releaseName: 'CUS Interview Assistant ${{ github.ref_name }}'
           releaseBody: 'Automatic interview assistant update.'
           releaseDraft: false
           prerelease: false
+          includeUpdaterJson: false
           args: ${{ matrix.args }}
