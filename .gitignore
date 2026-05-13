@@ -18,6 +18,8 @@ dist-ssr
 !.env.example
 src-tauri/.env
 
+*.key
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
