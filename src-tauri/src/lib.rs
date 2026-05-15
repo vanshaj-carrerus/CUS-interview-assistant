@@ -94,40 +94,155 @@ fn get_api_keys(app: AppHandle) -> HashMap<String, String> {
     keys
 }
 
+const BUNDLED_MODELS_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/vosk-model");
+
+fn is_vosk_model_dir(path: &Path) -> bool {
+    path.join("am").join("final.mdl").is_file()
+        && path.join("conf").join("model.conf").is_file()
+}
+
+fn normalize_model_dir(path: PathBuf) -> Option<PathBuf> {
+    if is_vosk_model_dir(&path) {
+        return Some(path);
+    }
+
+    let entries = std::fs::read_dir(&path).ok()?;
+    for entry in entries.flatten() {
+        let child = entry.path();
+        if child.is_dir() && is_vosk_model_dir(&child) {
+            return Some(child);
+        }
+    }
+    None
+}
+
+fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dst).map_err(|err| format!("Failed to create {dst:?}: {err}"))?;
+    for entry in std::fs::read_dir(src).map_err(|err| format!("Failed to read {src:?}: {err}"))? {
+        let entry = entry.map_err(|err| format!("Failed to read directory entry: {err}"))?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if entry.file_type().map_err(|err| err.to_string())?.is_dir() {
+            copy_dir_all(&src_path, &dst_path)?;
+        } else {
+            std::fs::copy(&src_path, &dst_path)
+                .map_err(|err| format!("Failed to copy {:?} to {:?}: {err}", src_path, dst_path))?;
+        }
+    }
+    Ok(())
+}
+
+fn path_for_vosk(path: PathBuf) -> String {
+    let mut text = path.to_string_lossy().into_owned();
+    if let Some(stripped) = text.strip_prefix(r"\\?\") {
+        text = stripped.to_string();
+    }
+    text
+}
+
+#[cfg(target_os = "windows")]
+fn ensure_vosk_dll_search_path() {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
+
+    let Ok(exe_path) = std::env::current_exe() else {
+        return;
+    };
+    let Some(exe_dir) = exe_path.parent() else {
+        return;
+    };
+    let wide: Vec<u16> = exe_dir
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    unsafe {
+        let _ = SetDllDirectoryW(PCWSTR(wide.as_ptr()));
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn ensure_vosk_dll_search_path() {}
+
+fn load_vosk_model(model_path: &str) -> Result<Model, String> {
+    ensure_vosk_dll_search_path();
+    let friendly_path = path_for_vosk(PathBuf::from(model_path));
+    Model::new(&friendly_path).ok_or_else(|| {
+        format!(
+            "Failed to load Vosk model at: {friendly_path}. \
+             Ensure am/final.mdl and conf/model.conf exist in that folder."
+        )
+    })
+}
+
+fn seed_model_dir(dest_root: &Path, source_root: &Path) -> Result<PathBuf, String> {
+    if let Some(existing) = normalize_model_dir(dest_root.to_path_buf()) {
+        return Ok(existing);
+    }
+
+    if dest_root.exists() {
+        std::fs::remove_dir_all(dest_root)
+            .map_err(|err| format!("Failed to reset incomplete Vosk model cache: {err}"))?;
+    }
+
+    if normalize_model_dir(source_root.to_path_buf()).is_none() {
+        return Err(format!(
+            "Bundled Vosk model is incomplete at: {}",
+            source_root.display()
+        ));
+    }
+
+    copy_dir_all(source_root, dest_root)?;
+    normalize_model_dir(dest_root.to_path_buf()).ok_or_else(|| {
+        format!(
+            "Copied Vosk model to {} but files are still missing.",
+            dest_root.display()
+        )
+    })
+}
+
 fn resolve_model_path(app: &AppHandle, model_path: Option<String>) -> Result<String, String> {
-    fn is_vosk_model_dir(path: &Path) -> bool {
-        path.join("am").join("final.mdl").exists() && path.join("conf").join("model.conf").exists()
-    }
-
-    fn normalize_model_dir(path: PathBuf) -> Option<PathBuf> {
-        if is_vosk_model_dir(&path) {
-            return Some(path);
-        }
-
-        let entries = std::fs::read_dir(&path).ok()?;
-        for entry in entries.flatten() {
-            let child = entry.path();
-            if child.is_dir() && is_vosk_model_dir(&child) {
-                return Some(child);
-            }
-        }
-        None
-    }
-
     if let Some(path) = model_path {
         let provided = PathBuf::from(&path);
         if !provided.exists() {
             return Err(format!("Configured Vosk model path does not exist: {path}"));
         }
-        if let Some(normalized) = normalize_model_dir(provided) {
-            return Ok(normalized.to_string_lossy().to_string());
-        }
-        return Err(format!(
-            "Configured Vosk model path is not a valid model directory: {path}"
-        ));
+        let normalized = normalize_model_dir(provided).ok_or_else(|| {
+            format!("Configured Vosk model path is not a valid model directory: {path}")
+        })?;
+        return Ok(path_for_vosk(normalized));
     }
 
     let mut candidates: Vec<PathBuf> = Vec::new();
+
+    // Populated by build.rs beside the executable for local dev and release builds.
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            candidates.push(exe_dir.join("models").join("vosk-model"));
+        }
+    }
+
+    // Source tree path (works during `tauri dev` / `cargo run`).
+    candidates.push(PathBuf::from(BUNDLED_MODELS_ROOT));
+
+    // Writable copy used when bundled resources are incomplete or read-only.
+    if let Ok(app_data) = app.path().app_data_dir() {
+        let seeded_root = app_data.join("models").join("vosk-model");
+        if let Ok(resource_root) = app
+            .path()
+            .resolve("models/vosk-model", BaseDirectory::Resource)
+        {
+            if normalize_model_dir(resource_root.clone()).is_some() {
+                if let Ok(seeded) = seed_model_dir(&seeded_root, &resource_root) {
+                    return Ok(path_for_vosk(seeded));
+                }
+            }
+        }
+        if let Some(seeded) = normalize_model_dir(seeded_root.clone()) {
+            return Ok(path_for_vosk(seeded));
+        }
+    }
 
     // Bundled with the installer (see `bundle.resources` in tauri.conf.json).
     if let Ok(resource_path) = app
@@ -141,17 +256,11 @@ fn resolve_model_path(app: &AppHandle, model_path: Option<String>) -> Result<Str
     candidates.push(PathBuf::from("models/vosk-model"));
     // Useful if cwd is repo root.
     candidates.push(PathBuf::from("src-tauri/models/vosk-model"));
-    // Useful for packaged app where model may be copied beside executable.
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            candidates.push(exe_dir.join("models").join("vosk-model"));
-        }
-    }
 
     for candidate in &candidates {
         if candidate.exists() {
             if let Some(normalized) = normalize_model_dir(candidate.clone()) {
-                return Ok(normalized.to_string_lossy().to_string());
+                return Ok(path_for_vosk(normalized));
             }
         }
     }
@@ -279,26 +388,16 @@ fn start_system_audio_transcription(
         return Ok(());
     }
 
+    let resolved_model_path = resolve_model_path(&app, model_path)?;
+    let model = load_vosk_model(&resolved_model_path)?;
+
     let (control_tx, control_rx) = mpsc::channel::<ControlMessage>();
     *tx_guard = Some(control_tx);
     drop(tx_guard);
 
-    let resolved_model_path = resolve_model_path(&app, model_path)?;
     let worker_app = app.clone();
 
     std::thread::spawn(move || {
-        let Some(model) = Model::new(&resolved_model_path) else {
-            emit_transcript(
-                &worker_app,
-                format!("Failed to load Vosk model at: {resolved_model_path}"),
-                true,
-            );
-            if let Ok(mut tx) = CAPTURE_TX.get_or_init(|| Mutex::new(None)).lock() {
-                *tx = None;
-            }
-            return;
-        };
-
         let host = cpal::default_host();
         let Some(device) = host.default_output_device() else {
             emit_transcript(
