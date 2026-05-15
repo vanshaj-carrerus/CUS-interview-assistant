@@ -1,6 +1,6 @@
 [package]
 name = "cus-interview-assistant"
-version = "0.0.8"
+version = "0.0.9"
 description = "Ai Interview Assistant"
 authors = ["Vanshaj"]
 edition = "2021"
@@ -30,6 +30,7 @@ tauri-plugin-process = "2"
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.52", features = [
     "Win32_Foundation",
+    "Win32_System_LibraryLoader",
     "Win32_UI_WindowsAndMessaging",
 ] }
 
