@@ -5,12 +5,14 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useRef, useState } from "react";
 import "./App.css";
 import { checkAndInstallUpdates } from "./lib/appUpdater";
+import { ensureApiKeysLoaded } from "./lib/apiConfig";
 import {
   buildInterviewCoachPrompt,
   coerceInterviewCoachJson,
   formatInterviewCoachJson,
   runMockInterviewPrompt,
 } from "./lib/interviewAiEngine";
+import { tauriErrorMessage } from "./lib/tauriError";
 
 type TranscriptPayload = {
   text: string;
@@ -79,6 +81,7 @@ function App() {
 
   useEffect(() => {
     void checkAndInstallUpdates();
+    void ensureApiKeysLoaded();
   }, []);
 
   useEffect(() => {
@@ -122,8 +125,7 @@ function App() {
       setIsListening(true);
       setCaptureMode("System audio capture active");
     } catch (error) {
-      const message =
-        error instanceof Error ? error.message : "Failed to start listening.";
+      const message = tauriErrorMessage(error, "Failed to start listening.");
       setErrorMessage(message);
       setIsListening(false);
       setCaptureMode("Idle");

@@ -1,10 +1,12 @@
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+use tauri::path::BaseDirectory;
 use tauri::{AppHandle, Emitter, Manager};
 use vosk::{CompleteResult, DecodingState, Model, Recognizer};
 
@@ -32,7 +34,67 @@ fn emit_transcript(app: &AppHandle, text: String, is_final: bool) {
     let _ = app.emit("transcript-event", TranscriptPayload { text, is_final });
 }
 
-fn resolve_model_path(model_path: Option<String>) -> Result<String, String> {
+fn parse_dotenv_line(line: &str, keys: &mut HashMap<String, String>) {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return;
+    }
+    let Some((name, value)) = line.split_once('=') else {
+        return;
+    };
+    let name = name.trim();
+    if !name.starts_with("VITE_") {
+        return;
+    }
+    let value = value
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim();
+    if !value.is_empty() {
+        keys.entry(name.to_string())
+            .or_insert_with(|| value.to_string());
+    }
+}
+
+fn compile_time_api_keys() -> HashMap<String, String> {
+    let mut keys = HashMap::new();
+    for (name, value) in [
+        ("VITE_GEMINI_API_KEY", option_env!("VITE_GEMINI_API_KEY")),
+        ("VITE_GROQ_API_KEY", option_env!("VITE_GROQ_API_KEY")),
+        ("VITE_MISTRAL_API_KEY", option_env!("VITE_MISTRAL_API_KEY")),
+        (
+            "VITE_OPENROUTER_API_KEY",
+            option_env!("VITE_OPENROUTER_API_KEY"),
+        ),
+    ] {
+        if let Some(v) = value {
+            let trimmed = v.trim();
+            if !trimmed.is_empty() {
+                keys.insert(name.to_string(), trimmed.to_string());
+            }
+        }
+    }
+    keys
+}
+
+#[tauri::command]
+fn get_api_keys(app: AppHandle) -> HashMap<String, String> {
+    let mut keys = compile_time_api_keys();
+
+    if let Ok(config_dir) = app.path().app_config_dir() {
+        let env_path = config_dir.join(".env");
+        if let Ok(content) = std::fs::read_to_string(&env_path) {
+            for line in content.lines() {
+                parse_dotenv_line(line, &mut keys);
+            }
+        }
+    }
+
+    keys
+}
+
+fn resolve_model_path(app: &AppHandle, model_path: Option<String>) -> Result<String, String> {
     fn is_vosk_model_dir(path: &Path) -> bool {
         path.join("am").join("final.mdl").exists() && path.join("conf").join("model.conf").exists()
     }
@@ -66,6 +128,14 @@ fn resolve_model_path(model_path: Option<String>) -> Result<String, String> {
     }
 
     let mut candidates: Vec<PathBuf> = Vec::new();
+
+    // Bundled with the installer (see `bundle.resources` in tauri.conf.json).
+    if let Ok(resource_path) = app
+        .path()
+        .resolve("models/vosk-model", BaseDirectory::Resource)
+    {
+        candidates.push(resource_path);
+    }
 
     // Useful for `tauri dev` where process cwd is usually `src-tauri`.
     candidates.push(PathBuf::from("models/vosk-model"));
@@ -213,7 +283,7 @@ fn start_system_audio_transcription(
     *tx_guard = Some(control_tx);
     drop(tx_guard);
 
-    let resolved_model_path = resolve_model_path(model_path)?;
+    let resolved_model_path = resolve_model_path(&app, model_path)?;
     let worker_app = app.clone();
 
     std::thread::spawn(move || {
@@ -353,6 +423,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            get_api_keys,
             start_system_audio_transcription,
             stop_system_audio_transcription
         ])
