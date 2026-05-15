@@ -1,4 +1,10 @@
 import { GoogleGenerativeAI } from "@google/generative-ai";
+import {
+  apiKey,
+  ensureApiKeysLoaded,
+  hasAnyApiKey,
+  type ApiKeyName,
+} from "./apiConfig";
 
 export type EngineResult<T> = {
   data: T;
@@ -13,9 +19,8 @@ export type InterviewCoachJson = {
   caveats?: string;
 };
 
-function env(key: string): string | undefined {
-  const v = import.meta.env[key];
-  return typeof v === "string" && v.trim() ? v.trim() : undefined;
+function env(key: ApiKeyName): string | undefined {
+  return apiKey(key);
 }
 
 export function parseJsonSafely<T>(raw: string): T {
@@ -259,28 +264,27 @@ const BACKEND_ORDER = ["Gemini", "Mistral", "Groq", "OpenRouter"] as const;
 export async function runMockInterviewPrompt<T>(
   prompt: string,
 ): Promise<EngineResult<T>> {
-  const tried: string[] = [];
+  await ensureApiKeysLoaded();
+
+  if (!hasAnyApiKey()) {
+    throw new Error(
+      "No interview AI API keys are configured. Set at least one of VITE_GEMINI_API_KEY, VITE_MISTRAL_API_KEY, VITE_GROQ_API_KEY, VITE_OPENROUTER_API_KEY in src-tauri/.env (local) or as GitHub Actions secrets for releases.",
+    );
+  }
 
   const gemini = await tryGemini<T>(prompt);
   if (gemini) return gemini;
-  tried.push(BACKEND_ORDER[0]);
 
   const mistral = await tryMistralChain<T>(prompt);
   if (mistral) return mistral;
-  tried.push(BACKEND_ORDER[1]);
 
   const groq = await tryGroqChain<T>(prompt);
   if (groq) return groq;
-  tried.push(BACKEND_ORDER[2]);
 
   const openRouter = await tryOpenRouter<T>(prompt);
   if (openRouter) return openRouter;
-  tried.push(BACKEND_ORDER[3]);
 
   throw new Error(
-    "All interview AI backends failed or are unavailable. " +
-      "Set at least one of VITE_GEMINI_API_KEY, VITE_MISTRAL_API_KEY, VITE_GROQ_API_KEY, VITE_OPENROUTER_API_KEY in .env, " +
-      "then check quotas and network. " +
-      `(Attempted in order: ${tried.join(" → ")}.)`,
+    `All interview AI backends failed or are unavailable. Set at least one of VITE_GEMINI_API_KEY, VITE_MISTRAL_API_KEY, VITE_GROQ_API_KEY, VITE_OPENROUTER_API_KEY in src-tauri/.env, then check quotas and network. (Attempted in order: ${BACKEND_ORDER.join(" → ")}.)`,
   );
 }
