@@ -12,57 +12,43 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - name: checkout
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: setup node
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: lts/*
           cache: npm
 
-      - name: install Rust stable
+      - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
 
-      - name: rust cache
-        uses: Swatinem/rust-cache@v2
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
         with:
           workspaces: ./src-tauri -> target
 
-      - name: install dependencies
+      - name: Install dependencies
         run: npm ci
 
-      - name: build Tauri bundles
+      - name: Build and publish release (with updater artifacts)
+        uses: tauri-apps/tauri-action@v0
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           CARGO_BUILD_JOBS: 4
           RUSTFLAGS: '-C target-feature=+crt-static'
-        run: npm run tauri -- build
-
-      - name: list bundle outputs
-        shell: pwsh
-        run: |
-          $bundle = "src-tauri/target/release/bundle"
-          if (-not (Test-Path $bundle)) {
-            Write-Error "Missing $bundle — build did not produce installers."
-            exit 1
-          }
-          Get-ChildItem -Path $bundle -Recurse -File | ForEach-Object { $_.FullName }
-
-      - name: upload release assets
-        uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          name: CUS Interview Assistant ${{ github.ref_name }}
-          body: Automatic interview assistant update.
-          draft: false
+          tagName: ${{ github.ref_name }}
+          releaseName: CUS Interview Assistant ${{ github.ref_name }}
+          releaseBody: |
+            Install the setup `.exe` for new users. Existing installs auto-update from this release.
+          releaseDraft: false
           prerelease: false
-          fail_on_unmatched_files: true
-          files: |
-            src-tauri/target/release/bundle/nsis/*-setup.exe
-            src-tauri/target/release/bundle/msi/*.msi
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          uploadUpdaterJson: true
+          updaterJsonPreferNsis: true
+          args: --target x86_64-pc-windows-msvc

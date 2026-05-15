@@ -1,7 +1,10 @@
+import { LogicalSize } from "@tauri-apps/api/dpi";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { useCallback, useEffect, useRef, useState } from "react";
 import "./App.css";
+import { checkAndInstallUpdates } from "./lib/appUpdater";
 import {
   buildInterviewCoachPrompt,
   coerceInterviewCoachJson,
@@ -21,6 +24,21 @@ type ChatMessage = {
   model?: string;
 };
 
+/** Join final + streaming partial for the textarea. Do not trim — trim breaks trailing spaces while typing. */
+function composeLiveTranscript(finalText: string, partial: string): string {
+  if (!partial) return finalText;
+  if (!finalText) return partial;
+  return `${finalText} ${partial}`;
+}
+
+/** Inner limits — keep in sync with `src-tauri/tauri.conf.json` window `minWidth` / `minHeight`. */
+const WINDOW_MIN_INNER = { width: 340, height: 260 };
+const WINDOW_DEFAULT_INNER = { width: 600, height: 600 };
+
+function isTauriRuntime(): boolean {
+  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
+}
+
 function App() {
   const [isListening, setIsListening] = useState(false);
   const [isSending, setIsSending] = useState(false);
@@ -29,8 +47,39 @@ function App() {
   const [partialTranscript, setPartialTranscript] = useState("");
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [errorMessage, setErrorMessage] = useState("");
+  const [isWindowCompact, setIsWindowCompact] = useState(false);
+  const savedInnerLogicalSizeRef = useRef<{ width: number; height: number } | null>(null);
 
   const scrollRef = useRef<HTMLDivElement>(null);
+
+  const toggleWindowCompact = useCallback(async () => {
+    if (!isTauriRuntime()) return;
+    try {
+      const appWindow = getCurrentWindow();
+      if (isWindowCompact) {
+        const restore = savedInnerLogicalSizeRef.current ?? WINDOW_DEFAULT_INNER;
+        await appWindow.setSize(new LogicalSize(restore.width, restore.height));
+        setIsWindowCompact(false);
+      } else {
+        const inner = await appWindow.innerSize();
+        const factor = await appWindow.scaleFactor();
+        savedInnerLogicalSizeRef.current = {
+          width: inner.width / factor,
+          height: inner.height / factor,
+        };
+        await appWindow.setSize(
+          new LogicalSize(WINDOW_MIN_INNER.width, WINDOW_MIN_INNER.height),
+        );
+        setIsWindowCompact(true);
+      }
+    } catch (e) {
+      console.error("[window compact]", e);
+    }
+  }, [isWindowCompact]);
+
+  useEffect(() => {
+    void checkAndInstallUpdates();
+  }, []);
 
   useEffect(() => {
     let unlisten: UnlistenFn | null = null;
@@ -96,7 +145,7 @@ function App() {
   };
 
   const sendToAi = async () => {
-    const snapshot = `${transcript}${partialTranscript ? ` ${partialTranscript}` : ""}`.trim();
+    const snapshot = composeLiveTranscript(transcript, partialTranscript).trim();
     if (!snapshot) {
       setErrorMessage(
         "Add what the recruiter said (listen, type, or paste), then send to AI.",
@@ -138,14 +187,16 @@ function App() {
     transcript.trim().length > 0 || partialTranscript.trim().length > 0;
   const showEmptyState = chatMessages.length === 0 && !hasTranscript;
 
-  const composedTranscript = useMemo(
-    () => `${transcript}${partialTranscript ? ` ${partialTranscript}` : ""}`.trim(),
-    [transcript, partialTranscript],
-  );
+  const liveTranscriptText = composeLiveTranscript(transcript, partialTranscript);
 
   return (
     <div className="flex h-full max-h-[calc(100vh-30px)] w-full flex-col overflow-hidden text-slate-100">
-      <Header isListening={isListening} captureMode={captureMode} />
+      <Header
+        isListening={isListening}
+        captureMode={captureMode}
+        isWindowCompact={isWindowCompact}
+        onToggleWindowCompact={toggleWindowCompact}
+      />
 
       <main className="relative flex-1 overflow-hidden">
         <div
@@ -172,7 +223,7 @@ function App() {
             {isSending && <TypingBubble />}
 
             <UserBubble
-              value={composedTranscript}
+              value={liveTranscriptText}
               readOnly={false}
               isPartialActive={partialTranscript.length > 0}
               placeholder="Live transcript appears here while listening. If capture is not working, type or paste what you heard, then Send to AI."
@@ -195,7 +246,7 @@ function App() {
       <Composer
         isListening={isListening}
         isSending={isSending}
-        canSend={composedTranscript.trim().length > 0}
+        canSend={liveTranscriptText.trim().length > 0}
         onStart={startListening}
         onStop={stopListening}
         onSend={sendToAi}
@@ -208,9 +259,13 @@ function App() {
 function Header({
   isListening,
   captureMode,
+  isWindowCompact,
+  onToggleWindowCompact,
 }: {
   isListening: boolean;
   captureMode: string;
+  isWindowCompact: boolean;
+  onToggleWindowCompact: () => void;
 }) {
   return (
     <header className="flex shrink-0 items-center justify-between gap-3 border-b border-white/5 bg-surface/40 px-4 py-3 backdrop-blur-md">
@@ -228,26 +283,53 @@ function Header({
         </div>
       </div>
 
-      <span
-        className={
-          "inline-flex items-center gap-2 rounded-full border px-2.5 py-1 text-[11px] font-medium tracking-wide " +
-          (isListening
-            ? "border-emerald-400/40 bg-emerald-400/10 text-emerald-300"
-            : "border-white/10 bg-white/5 text-slate-300")
-        }
-      >
-        {isListening ? (
-          <>
-            <span className="listening-dot" />
-            Listening
-          </>
-        ) : (
-          <>
-            <span className="size-1.5 rounded-full bg-slate-500" />
-            Idle
-          </>
+      <div className="flex shrink-0 items-center gap-2">
+        {isTauriRuntime() && (
+          <button
+            type="button"
+            onClick={() => {
+              void onToggleWindowCompact();
+            }}
+            title={
+              isWindowCompact
+                ? "Restore window size"
+                : "Shrink window to minimum size"
+            }
+            aria-label={
+              isWindowCompact
+                ? "Restore window size"
+                : "Shrink window to minimum size"
+            }
+            className="grid size-9 shrink-0 place-items-center rounded-lg border border-white/10 bg-white/5 text-slate-200 transition hover:bg-white/10 active:scale-[0.97]"
+          >
+            {isWindowCompact ? (
+              <RestoreWindowIcon className="size-4" />
+            ) : (
+              <MinimizeWindowIcon className="size-4" />
+            )}
+          </button>
         )}
-      </span>
+        <span
+          className={
+            "inline-flex items-center gap-2 rounded-full border px-2.5 py-1 text-[11px] font-medium tracking-wide " +
+            (isListening
+              ? "border-emerald-400/40 bg-emerald-400/10 text-emerald-300"
+              : "border-white/10 bg-white/5 text-slate-300")
+          }
+        >
+          {isListening ? (
+            <>
+              <span className="listening-dot" />
+              Listening
+            </>
+          ) : (
+            <>
+              <span className="size-1.5 rounded-full bg-slate-500" />
+              Idle
+            </>
+          )}
+        </span>
+      </div>
     </header>
   );
 }
@@ -466,7 +548,7 @@ function Composer({
           type="button"
           onClick={onSend}
           disabled={isSending || !canSend}
-          className="group inline-flex items-center gap-2 rounded-full bg-linear-to-br from-primary to-secondary px-4 py-2 text-[13px] font-semibold text-primary-foreground shadow-lg shadow-primary/25 transition hover:brightness-110 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-50 disabled:shadow-none disabled:hover:brightness-100"
+          className="group inline-flex cursor-pointer items-center gap-2 rounded-full bg-linear-to-br from-primary to-secondary px-4 py-2 text-[13px] font-semibold text-primary-foreground shadow-lg shadow-primary/25 transition hover:brightness-110 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-50 disabled:shadow-none disabled:hover:brightness-100"
         >
           {isSending ? (
             <>
@@ -628,6 +710,41 @@ function CloseIcon({ className }: IconProps) {
       aria-hidden
     >
       <path d="M18 6 6 18M6 6l12 12" />
+    </svg>
+  );
+}
+
+/** Titlebar-style minimize (shrinks to configured minimum inner size). */
+function MinimizeWindowIcon({ className }: IconProps) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      className={className}
+      aria-hidden
+    >
+      <path d="M5 12h14" />
+    </svg>
+  );
+}
+
+function RestoreWindowIcon({ className }: IconProps) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden
+    >
+      <path d="M8 6H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2v-2" />
+      <rect x="10" y="4" width="10" height="10" rx="2" />
     </svg>
   );
 }
