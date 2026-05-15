@@ -197,7 +197,10 @@ fn build_loopback_stream(
 }
 
 #[tauri::command]
-fn start_system_audio_transcription(app: AppHandle, model_path: Option<String>) -> Result<(), String> {
+fn start_system_audio_transcription(
+    app: AppHandle,
+    model_path: Option<String>,
+) -> Result<(), String> {
     let tx_store = CAPTURE_TX.get_or_init(|| Mutex::new(None));
     let mut tx_guard = tx_store
         .lock()
@@ -228,7 +231,11 @@ fn start_system_audio_transcription(app: AppHandle, model_path: Option<String>) 
 
         let host = cpal::default_host();
         let Some(device) = host.default_output_device() else {
-            emit_transcript(&worker_app, "No output audio device found.".to_string(), true);
+            emit_transcript(
+                &worker_app,
+                "No output audio device found.".to_string(),
+                true,
+            );
             if let Ok(mut tx) = CAPTURE_TX.get_or_init(|| Mutex::new(None)).lock() {
                 *tx = None;
             }
@@ -236,7 +243,11 @@ fn start_system_audio_transcription(app: AppHandle, model_path: Option<String>) 
         };
 
         let Ok(output_config) = device.default_output_config() else {
-            emit_transcript(&worker_app, "Unable to read output device config.".to_string(), true);
+            emit_transcript(
+                &worker_app,
+                "Unable to read output device config.".to_string(),
+                true,
+            );
             if let Ok(mut tx) = CAPTURE_TX.get_or_init(|| Mutex::new(None)).lock() {
                 *tx = None;
             }
@@ -245,7 +256,11 @@ fn start_system_audio_transcription(app: AppHandle, model_path: Option<String>) 
 
         let sample_rate = output_config.sample_rate().0 as f32;
         let Some(recognizer) = Recognizer::new(&model, sample_rate) else {
-            emit_transcript(&worker_app, "Failed to create Vosk recognizer.".to_string(), true);
+            emit_transcript(
+                &worker_app,
+                "Failed to create Vosk recognizer.".to_string(),
+                true,
+            );
             if let Ok(mut tx) = CAPTURE_TX.get_or_init(|| Mutex::new(None)).lock() {
                 *tx = None;
             }
@@ -312,6 +327,8 @@ fn stop_system_audio_transcription() -> Result<(), String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             let window = app
@@ -329,11 +346,7 @@ pub fn run() {
                 unsafe {
                     let hwnd = HWND(hwnd_raw as _);
                     let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-                    SetWindowLongPtrW(
-                        hwnd,
-                        GWL_EXSTYLE,
-                        ex_style | WS_EX_TOOLWINDOW.0 as isize,
-                    );
+                    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style | WS_EX_TOOLWINDOW.0 as isize);
                 }
             }
 

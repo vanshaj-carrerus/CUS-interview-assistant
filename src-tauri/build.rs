@@ -9,7 +9,8 @@ fn main() {
         return;
     }
 
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR missing"));
+    let manifest_dir =
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR missing"));
     let vosk_dir = manifest_dir.join("vosk");
 
     println!("cargo:rerun-if-changed={}", vosk_dir.display());
