@@ -1,5 +1,5 @@
 #![allow(clippy::uninlined_format_args)]
-
+0
 extern crate bindgen;
 extern crate semver;
 
