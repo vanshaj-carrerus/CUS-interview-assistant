@@ -19,6 +19,27 @@ Download a GGML English model into `src-tauri/models/whisper/`:
 
 See `src-tauri/models/whisper/README.md` for layout details.
 
+### Git LFS (repository includes bundled models)
+
+Whisper `.bin` files are stored with [Git LFS](https://git-lfs.com/) (GitHub rejects them as normal Git blobs).
+
+**One-time on your machine:**
+
+```powershell
+winget install GitHub.GitLFS
+git lfs install
+```
+
+**Clone or pull models:**
+
+```bash
+git clone https://github.com/vanshaj-carrerus/CUS-interview-assistant.git
+cd CUS-interview-assistant
+git lfs pull
+```
+
+If models are missing after clone, run `git lfs pull` in the repo root.
+
 ## AI API keys (for “Send to AI” only)
 
 STT is fully local. Cloud keys are only used for interview coaching:
