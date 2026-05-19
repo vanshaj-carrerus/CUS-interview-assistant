@@ -2,6 +2,12 @@
 
 Place a Whisper **GGML** model file in this folder before building or running the app.
 
+If this repo stores models with Git LFS, fetch the real binaries (not the ~130-byte pointer stubs):
+
+```bash
+git lfs pull --include="src-tauri/models/whisper/*.bin"
+```
+
 Recommended downloads (English):
 
 - [ggml-base.en.bin](https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin) (~142 MB, better accuracy)

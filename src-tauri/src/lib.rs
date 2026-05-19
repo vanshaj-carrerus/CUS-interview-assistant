@@ -28,6 +28,8 @@ const RMS_SILENCE_THRESHOLD: f32 = 0.008;
 const MIN_UTTERANCE_SECS: f64 = 0.35;
 const BUNDLED_WHISPER_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/whisper");
 const PREFERRED_MODELS: &[&str] = &["ggml-base.en.bin", "ggml-tiny.en.bin"];
+/// Real GGML Whisper models are tens of MB; LFS pointer stubs are ~130 bytes.
+const MIN_WHISPER_MODEL_BYTES: u64 = 1_000_000;
 
 #[derive(Clone, Serialize)]
 struct SttErrorPayload {
@@ -147,6 +149,34 @@ fn is_whisper_model_file(path: &Path) -> bool {
             .is_some_and(|ext| ext.eq_ignore_ascii_case("bin"))
 }
 
+fn validate_whisper_model_file(path: &Path) -> Result<(), String> {
+    let metadata = std::fs::metadata(path)
+        .map_err(|err| format!("Cannot read Whisper model at {}: {err}", path.display()))?;
+    if metadata.len() >= MIN_WHISPER_MODEL_BYTES {
+        return Ok(());
+    }
+
+    let looks_like_lfs_pointer = std::fs::read(path)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .is_some_and(|content| content.starts_with("version https://git-lfs.github.com/spec/v1"));
+
+    if looks_like_lfs_pointer {
+        return Err(
+            "Whisper model file is a Git LFS pointer, not the downloaded model. \
+             Run: git lfs pull --include=\"src-tauri/models/whisper/*.bin\""
+                .to_string(),
+        );
+    }
+
+    Err(format!(
+        "Whisper model at {} is too small ({} bytes). \
+         Download ggml-base.en.bin into src-tauri/models/whisper/ (see models/whisper/README.md).",
+        path.display(),
+        metadata.len()
+    ))
+}
+
 fn find_model_in_dir(dir: &Path) -> Option<PathBuf> {
     for name in PREFERRED_MODELS {
         let candidate = dir.join(name);
@@ -177,6 +207,7 @@ fn resolve_whisper_model_path(app: &AppHandle, model_path: String) -> Result<Str
                 "Whisper model path must be a .bin GGML file: {trimmed}"
             ));
         }
+        validate_whisper_model_file(&provided)?;
         return Ok(normalize_path(provided));
     }
 
@@ -207,9 +238,11 @@ fn resolve_whisper_model_path(app: &AppHandle, model_path: String) -> Result<Str
     for candidate in candidates {
         if candidate.is_dir() {
             if let Some(model) = find_model_in_dir(&candidate) {
+                validate_whisper_model_file(&model)?;
                 return Ok(normalize_path(model));
             }
         } else if is_whisper_model_file(&candidate) {
+            validate_whisper_model_file(&candidate)?;
             return Ok(normalize_path(candidate));
         }
     }
