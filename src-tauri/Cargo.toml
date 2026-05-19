@@ -1,6 +1,6 @@
 [package]
 name = "cus-interview-assistant"
-version = "0.0.10"
+version = "0.0.11"
 description = "Ai Interview Assistant"
 authors = ["Vanshaj"]
 edition = "2021"
