@@ -3,12 +3,15 @@ use cpal::{SampleFormat, StreamConfig};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Sender};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 use tauri::path::BaseDirectory;
-use tauri::{AppHandle, Emitter, Manager};
-use vosk::{CompleteResult, DecodingState, Model, Recognizer};
+use tauri::{AppHandle, Emitter, Manager, State};
+use whisper_rs::{
+    FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters,
+};
 
 #[cfg(target_os = "windows")]
 use windows::Win32::{
@@ -18,20 +21,54 @@ use windows::Win32::{
     },
 };
 
+const WHISPER_SAMPLE_RATE: u32 = 16_000;
+const FRAME_MS: u32 = 40;
+const SILENCE_END_SECS: f64 = 1.5;
+const RMS_SILENCE_THRESHOLD: f32 = 0.008;
+const MIN_UTTERANCE_SECS: f64 = 0.35;
+const BUNDLED_WHISPER_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/whisper");
+const PREFERRED_MODELS: &[&str] = &["ggml-base.en.bin", "ggml-tiny.en.bin"];
+
 #[derive(Clone, Serialize)]
-struct TranscriptPayload {
-    text: String,
-    is_final: bool,
+struct SttErrorPayload {
+    message: String,
 }
 
 enum ControlMessage {
     Stop,
 }
 
-static CAPTURE_TX: OnceLock<Mutex<Option<Sender<ControlMessage>>>> = OnceLock::new();
+enum InferenceMessage {
+    Transcribe(Vec<f32>),
+    Stop,
+}
 
-fn emit_transcript(app: &AppHandle, text: String, is_final: bool) {
-    let _ = app.emit("transcript-event", TranscriptPayload { text, is_final });
+pub struct AppState {
+    whisper: Mutex<Option<Arc<WhisperContext>>>,
+    listen_control: Mutex<Option<Sender<ControlMessage>>>,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            whisper: Mutex::new(None),
+            listen_control: Mutex::new(None),
+        }
+    }
+}
+
+fn emit_stt_result(app: &AppHandle, text: String) {
+    let _ = app.emit("stt-result", text);
+}
+
+fn emit_stt_error(app: &AppHandle, message: String) {
+    let _ = app.emit(
+        "stt-error",
+        SttErrorPayload {
+            message: message.clone(),
+        },
+    );
+    eprintln!("[stt] {message}");
 }
 
 fn parse_dotenv_line(line: &str, keys: &mut HashMap<String, String>) {
@@ -94,45 +131,7 @@ fn get_api_keys(app: AppHandle) -> HashMap<String, String> {
     keys
 }
 
-const BUNDLED_MODELS_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/vosk-model");
-
-fn is_vosk_model_dir(path: &Path) -> bool {
-    path.join("am").join("final.mdl").is_file()
-        && path.join("conf").join("model.conf").is_file()
-}
-
-fn normalize_model_dir(path: PathBuf) -> Option<PathBuf> {
-    if is_vosk_model_dir(&path) {
-        return Some(path);
-    }
-
-    let entries = std::fs::read_dir(&path).ok()?;
-    for entry in entries.flatten() {
-        let child = entry.path();
-        if child.is_dir() && is_vosk_model_dir(&child) {
-            return Some(child);
-        }
-    }
-    None
-}
-
-fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(dst).map_err(|err| format!("Failed to create {dst:?}: {err}"))?;
-    for entry in std::fs::read_dir(src).map_err(|err| format!("Failed to read {src:?}: {err}"))? {
-        let entry = entry.map_err(|err| format!("Failed to read directory entry: {err}"))?;
-        let src_path = entry.path();
-        let dst_path = dst.join(entry.file_name());
-        if entry.file_type().map_err(|err| err.to_string())?.is_dir() {
-            copy_dir_all(&src_path, &dst_path)?;
-        } else {
-            std::fs::copy(&src_path, &dst_path)
-                .map_err(|err| format!("Failed to copy {:?} to {:?}: {err}", src_path, dst_path))?;
-        }
-    }
-    Ok(())
-}
-
-fn path_for_vosk(path: PathBuf) -> String {
+fn normalize_path(path: PathBuf) -> String {
     let mut text = path.to_string_lossy().into_owned();
     if let Some(stripped) = text.strip_prefix(r"\\?\") {
         text = stripped.to_string();
@@ -140,162 +139,242 @@ fn path_for_vosk(path: PathBuf) -> String {
     text
 }
 
-#[cfg(target_os = "windows")]
-fn ensure_vosk_dll_search_path() {
-    use std::os::windows::ffi::OsStrExt;
-    use windows::core::PCWSTR;
-    use windows::Win32::System::LibraryLoader::SetDllDirectoryW;
-
-    let Ok(exe_path) = std::env::current_exe() else {
-        return;
-    };
-    let Some(exe_dir) = exe_path.parent() else {
-        return;
-    };
-    let wide: Vec<u16> = exe_dir
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    unsafe {
-        let _ = SetDllDirectoryW(PCWSTR(wide.as_ptr()));
-    }
+fn is_whisper_model_file(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("bin"))
 }
 
-#[cfg(not(target_os = "windows"))]
-fn ensure_vosk_dll_search_path() {}
-
-fn load_vosk_model(model_path: &str) -> Result<Model, String> {
-    ensure_vosk_dll_search_path();
-    let friendly_path = path_for_vosk(PathBuf::from(model_path));
-    Model::new(&friendly_path).ok_or_else(|| {
-        format!(
-            "Failed to load Vosk model at: {friendly_path}. \
-             Ensure am/final.mdl and conf/model.conf exist in that folder."
-        )
-    })
-}
-
-fn seed_model_dir(dest_root: &Path, source_root: &Path) -> Result<PathBuf, String> {
-    if let Some(existing) = normalize_model_dir(dest_root.to_path_buf()) {
-        return Ok(existing);
-    }
-
-    if dest_root.exists() {
-        std::fs::remove_dir_all(dest_root)
-            .map_err(|err| format!("Failed to reset incomplete Vosk model cache: {err}"))?;
-    }
-
-    if normalize_model_dir(source_root.to_path_buf()).is_none() {
-        return Err(format!(
-            "Bundled Vosk model is incomplete at: {}",
-            source_root.display()
-        ));
-    }
-
-    copy_dir_all(source_root, dest_root)?;
-    normalize_model_dir(dest_root.to_path_buf()).ok_or_else(|| {
-        format!(
-            "Copied Vosk model to {} but files are still missing.",
-            dest_root.display()
-        )
-    })
-}
-
-fn resolve_model_path(app: &AppHandle, model_path: Option<String>) -> Result<String, String> {
-    if let Some(path) = model_path {
-        let provided = PathBuf::from(&path);
-        if !provided.exists() {
-            return Err(format!("Configured Vosk model path does not exist: {path}"));
+fn find_model_in_dir(dir: &Path) -> Option<PathBuf> {
+    for name in PREFERRED_MODELS {
+        let candidate = dir.join(name);
+        if is_whisper_model_file(&candidate) {
+            return Some(candidate);
         }
-        let normalized = normalize_model_dir(provided).ok_or_else(|| {
-            format!("Configured Vosk model path is not a valid model directory: {path}")
-        })?;
-        return Ok(path_for_vosk(normalized));
+    }
+
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if is_whisper_model_file(&path) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn resolve_whisper_model_path(app: &AppHandle, model_path: String) -> Result<String, String> {
+    let trimmed = model_path.trim();
+    if !trimmed.is_empty() {
+        let provided = PathBuf::from(trimmed);
+        if !provided.exists() {
+            return Err(format!("Whisper model path does not exist: {trimmed}"));
+        }
+        if !is_whisper_model_file(&provided) {
+            return Err(format!(
+                "Whisper model path must be a .bin GGML file: {trimmed}"
+            ));
+        }
+        return Ok(normalize_path(provided));
     }
 
     let mut candidates: Vec<PathBuf> = Vec::new();
 
-    // Populated by build.rs beside the executable for local dev and release builds.
     if let Ok(exe_path) = std::env::current_exe() {
         if let Some(exe_dir) = exe_path.parent() {
-            candidates.push(exe_dir.join("models").join("vosk-model"));
+            candidates.push(exe_dir.join("models").join("whisper"));
         }
     }
 
-    // Source tree path (works during `tauri dev` / `cargo run`).
-    candidates.push(PathBuf::from(BUNDLED_MODELS_ROOT));
+    candidates.push(PathBuf::from(BUNDLED_WHISPER_ROOT));
 
-    // Writable copy used when bundled resources are incomplete or read-only.
-    if let Ok(app_data) = app.path().app_data_dir() {
-        let seeded_root = app_data.join("models").join("vosk-model");
-        if let Ok(resource_root) = app
-            .path()
-            .resolve("models/vosk-model", BaseDirectory::Resource)
-        {
-            if normalize_model_dir(resource_root.clone()).is_some() {
-                if let Ok(seeded) = seed_model_dir(&seeded_root, &resource_root) {
-                    return Ok(path_for_vosk(seeded));
-                }
-            }
-        }
-        if let Some(seeded) = normalize_model_dir(seeded_root.clone()) {
-            return Ok(path_for_vosk(seeded));
-        }
-    }
-
-    // Bundled with the installer (see `bundle.resources` in tauri.conf.json).
     if let Ok(resource_path) = app
         .path()
-        .resolve("models/vosk-model", BaseDirectory::Resource)
+        .resolve("models/whisper", BaseDirectory::Resource)
     {
         candidates.push(resource_path);
     }
 
-    // Useful for `tauri dev` where process cwd is usually `src-tauri`.
-    candidates.push(PathBuf::from("models/vosk-model"));
-    // Useful if cwd is repo root.
-    candidates.push(PathBuf::from("src-tauri/models/vosk-model"));
+    candidates.push(PathBuf::from("models/whisper"));
+    candidates.push(PathBuf::from("src-tauri/models/whisper"));
 
-    for candidate in &candidates {
-        if candidate.exists() {
-            if let Some(normalized) = normalize_model_dir(candidate.clone()) {
-                return Ok(path_for_vosk(normalized));
+    if let Ok(app_data) = app.path().app_data_dir() {
+        candidates.push(app_data.join("models").join("whisper"));
+    }
+
+    for candidate in candidates {
+        if candidate.is_dir() {
+            if let Some(model) = find_model_in_dir(&candidate) {
+                return Ok(normalize_path(model));
             }
+        } else if is_whisper_model_file(&candidate) {
+            return Ok(normalize_path(candidate));
         }
     }
 
-    let searched_paths = candidates
-        .iter()
-        .map(|p| p.to_string_lossy().to_string())
-        .collect::<Vec<String>>()
-        .join(", ");
     Err(format!(
-        "Vosk model path is invalid. Put a model at one of: {searched_paths}"
+        "Whisper model not found. Download ggml-base.en.bin or ggml-tiny.en.bin into src-tauri/models/whisper/ (see models/whisper/README.md)."
     ))
 }
 
-fn recognize_chunk(recognizer: &Arc<Mutex<Recognizer>>, app: &AppHandle, mono_samples: Vec<i16>) {
-    let Ok(mut recognizer) = recognizer.lock() else {
-        return;
-    };
+fn load_whisper_context(model_path: &str) -> Result<WhisperContext, String> {
+    WhisperContext::new_with_params(model_path, WhisperContextParameters::default())
+        .map_err(|err| format!("Failed to load Whisper model at {model_path}: {err}"))
+}
 
-    match recognizer.accept_waveform(&mono_samples) {
-        Ok(DecodingState::Finalized) => {
-            if let CompleteResult::Single(result) = recognizer.result() {
-                let text = result.text.trim();
-                if !text.is_empty() {
-                    emit_transcript(app, text.to_string(), true);
+fn transcribe_samples(ctx: &WhisperContext, samples: &[f32]) -> Result<String, String> {
+    if samples.len() < (WHISPER_SAMPLE_RATE as f64 * MIN_UTTERANCE_SECS) as usize {
+        return Ok(String::new());
+    }
+
+    let mut state = ctx
+        .create_state()
+        .map_err(|err| format!("Failed to create Whisper state: {err}"))?;
+
+    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    params.set_language(Some("en"));
+    params.set_translate(false);
+    params.set_print_special(false);
+    params.set_print_progress(false);
+    params.set_print_realtime(false);
+    params.set_print_timestamps(false);
+
+    let threads = thread::available_parallelism()
+        .map(|n| n.get() as i32)
+        .unwrap_or(4)
+        .clamp(1, 8);
+    params.set_n_threads(threads);
+
+    state
+        .full(params, samples)
+        .map_err(|err| format!("Whisper inference failed: {err}"))?;
+
+    let num_segments = state.full_n_segments();
+    let mut text = String::new();
+    for i in 0..num_segments {
+        let Some(segment) = state.get_segment(i) else {
+            continue;
+        };
+        let segment = segment
+            .to_str_lossy()
+            .map_err(|err| format!("Failed to read segment {i}: {err}"))?;
+        if !segment.is_empty() {
+            if !text.is_empty() && !text.ends_with(' ') {
+                text.push(' ');
+            }
+            text.push_str(segment.trim());
+        }
+    }
+
+    Ok(text.trim().to_string())
+}
+
+fn frame_rms(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
+    (sum_sq / samples.len() as f32).sqrt()
+}
+
+fn downsample_nearest(input: &[f32], input_rate: u32, target_rate: u32) -> Vec<f32> {
+    if input.is_empty() || input_rate == 0 || target_rate == 0 {
+        return Vec::new();
+    }
+    if input_rate == target_rate {
+        return input.to_vec();
+    }
+
+    let ratio = input_rate as f64 / target_rate as f64;
+    let out_len = ((input.len() as f64) / ratio).floor() as usize;
+    let mut out = Vec::with_capacity(out_len);
+    for i in 0..out_len {
+        let src_idx = (i as f64 * ratio).floor() as usize;
+        let sample = input.get(src_idx).copied().unwrap_or(0.0);
+        out.push(sample.clamp(-1.0, 1.0));
+    }
+    out
+}
+
+fn mono_from_interleaved<T: Copy>(data: &[T], channels: usize, to_f32: impl Fn(T) -> f32) -> Vec<f32> {
+    if channels == 0 {
+        return Vec::new();
+    }
+    data.chunks(channels)
+        .map(|frame| {
+            let sum: f32 = frame.iter().map(|&sample| to_f32(sample)).sum();
+            (sum / channels as f32).clamp(-1.0, 1.0)
+        })
+        .collect()
+}
+
+struct VadBuffer {
+    utterance: Vec<f32>,
+    silence_ms: f64,
+    had_speech: bool,
+    frame_ms: f64,
+}
+
+impl VadBuffer {
+    fn new(frame_ms: f64) -> Self {
+        Self {
+            utterance: Vec::new(),
+            silence_ms: 0.0,
+            had_speech: false,
+            frame_ms,
+        }
+    }
+
+    fn push_frame(&mut self, frame: &[f32]) -> Option<Vec<f32>> {
+        let energy = frame_rms(frame);
+        let is_speech = energy >= RMS_SILENCE_THRESHOLD;
+
+        if is_speech {
+            self.had_speech = true;
+            self.silence_ms = 0.0;
+            self.utterance.extend_from_slice(frame);
+            return None;
+        }
+
+        if self.had_speech {
+            self.utterance.extend_from_slice(frame);
+            self.silence_ms += self.frame_ms;
+            if self.silence_ms >= SILENCE_END_SECS * 1000.0 {
+                let min_samples = (WHISPER_SAMPLE_RATE as f64 * MIN_UTTERANCE_SECS) as usize;
+                if self.utterance.len() >= min_samples {
+                    let chunk = std::mem::take(&mut self.utterance);
+                    self.had_speech = false;
+                    self.silence_ms = 0.0;
+                    return Some(chunk);
+                }
+                self.utterance.clear();
+                self.had_speech = false;
+                self.silence_ms = 0.0;
+            }
+        }
+
+        None
+    }
+}
+
+fn run_inference_worker(
+    ctx: Arc<WhisperContext>,
+    app: AppHandle,
+    inference_rx: Receiver<InferenceMessage>,
+) {
+    while let Ok(message) = inference_rx.recv() {
+        match message {
+            InferenceMessage::Stop => break,
+            InferenceMessage::Transcribe(samples) => {
+                match transcribe_samples(ctx.as_ref(), &samples) {
+                    Ok(text) if !text.is_empty() => emit_stt_result(&app, text),
+                    Ok(_) => {}
+                    Err(err) => emit_stt_error(&app, err),
                 }
             }
         }
-        Ok(DecodingState::Running) => {
-            let text = recognizer.partial_result().partial.trim().to_string();
-            if !text.is_empty() {
-                emit_transcript(app, text, false);
-            }
-        }
-        Ok(DecodingState::Failed) | Err(_) => {}
     }
 }
 
@@ -303,31 +382,41 @@ fn build_loopback_stream(
     device: &cpal::Device,
     config: &StreamConfig,
     sample_format: SampleFormat,
-    recognizer: Arc<Mutex<Recognizer>>,
-    app: AppHandle,
+    source_sample_rate: u32,
+    inference_tx: Sender<InferenceMessage>,
 ) -> Result<cpal::Stream, String> {
     let channels = usize::from(config.channels.max(1));
-    let app_for_error = app.clone();
-    let error_callback = move |err| {
-        let message = format!("Audio capture error: {err}");
-        eprintln!("{message}");
-        emit_transcript(&app_for_error, message, true);
+    let frame_samples =
+        ((WHISPER_SAMPLE_RATE as f64 * FRAME_MS as f64) / 1000.0).round() as usize;
+    let frame_ms = FRAME_MS as f64;
+    let mut vad = VadBuffer::new(frame_ms);
+    let mut pending_16k: Vec<f32> = Vec::new();
+
+    let push_pending = move |pending: &mut Vec<f32>, vad: &mut VadBuffer| {
+        while pending.len() >= frame_samples {
+            let frame: Vec<f32> = pending.drain(..frame_samples).collect();
+            if let Some(chunk) = vad.push_frame(&frame) {
+                if inference_tx
+                    .send(InferenceMessage::Transcribe(chunk))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
     };
+
+    let error_callback = |err| eprintln!("Audio capture error: {err}");
 
     match sample_format {
         SampleFormat::F32 => device
             .build_input_stream(
                 config,
                 move |data: &[f32], _| {
-                    let mono_samples = data
-                        .chunks(channels)
-                        .map(|frame| {
-                            let sum = frame.iter().copied().sum::<f32>();
-                            let avg = sum / channels as f32;
-                            (avg.clamp(-1.0, 1.0) * i16::MAX as f32) as i16
-                        })
-                        .collect::<Vec<i16>>();
-                    recognize_chunk(&recognizer, &app, mono_samples);
+                    let mono = mono_from_interleaved(data, channels, |s| s);
+                    let mono_16k = downsample_nearest(&mono, source_sample_rate, WHISPER_SAMPLE_RATE);
+                    pending_16k.extend_from_slice(&mono_16k);
+                    push_pending(&mut pending_16k, &mut vad);
                 },
                 error_callback,
                 None,
@@ -337,14 +426,12 @@ fn build_loopback_stream(
             .build_input_stream(
                 config,
                 move |data: &[i16], _| {
-                    let mono_samples = data
-                        .chunks(channels)
-                        .map(|frame| {
-                            let sum = frame.iter().copied().map(i32::from).sum::<i32>();
-                            (sum / channels as i32) as i16
-                        })
-                        .collect::<Vec<i16>>();
-                    recognize_chunk(&recognizer, &app, mono_samples);
+                    let mono = mono_from_interleaved(data, channels, |s| {
+                        s as f32 / i16::MAX as f32
+                    });
+                    let mono_16k = downsample_nearest(&mono, source_sample_rate, WHISPER_SAMPLE_RATE);
+                    pending_16k.extend_from_slice(&mono_16k);
+                    push_pending(&mut pending_16k, &mut vad);
                 },
                 error_callback,
                 None,
@@ -354,18 +441,12 @@ fn build_loopback_stream(
             .build_input_stream(
                 config,
                 move |data: &[u16], _| {
-                    let mono_samples = data
-                        .chunks(channels)
-                        .map(|frame| {
-                            let sum = frame
-                                .iter()
-                                .copied()
-                                .map(|sample| i32::from(sample) - i32::from(u16::MAX / 2))
-                                .sum::<i32>();
-                            (sum / channels as i32) as i16
-                        })
-                        .collect::<Vec<i16>>();
-                    recognize_chunk(&recognizer, &app, mono_samples);
+                    let mono = mono_from_interleaved(data, channels, |s| {
+                        (f32::from(s) - 32768.0) / 32768.0
+                    });
+                    let mono_16k = downsample_nearest(&mono, source_sample_rate, WHISPER_SAMPLE_RATE);
+                    pending_16k.extend_from_slice(&mono_16k);
+                    push_pending(&mut pending_16k, &mut vad);
                 },
                 error_callback,
                 None,
@@ -375,92 +456,69 @@ fn build_loopback_stream(
     }
 }
 
-#[tauri::command]
-fn start_system_audio_transcription(
+fn start_listening_thread(
     app: AppHandle,
-    model_path: Option<String>,
+    ctx: Arc<WhisperContext>,
+    control_rx: Receiver<ControlMessage>,
 ) -> Result<(), String> {
-    let tx_store = CAPTURE_TX.get_or_init(|| Mutex::new(None));
-    let mut tx_guard = tx_store
-        .lock()
-        .map_err(|_| "Failed to lock capture state".to_string())?;
-    if tx_guard.is_some() {
-        return Ok(());
-    }
+    let (inference_tx, inference_rx) = mpsc::channel::<InferenceMessage>();
+    let inference_app = app.clone();
+    let inference_ctx = Arc::clone(&ctx);
 
-    let resolved_model_path = resolve_model_path(&app, model_path)?;
-    let model = load_vosk_model(&resolved_model_path)?;
+    thread::spawn(move || {
+        run_inference_worker(inference_ctx, inference_app, inference_rx);
+    });
 
-    let (control_tx, control_rx) = mpsc::channel::<ControlMessage>();
-    *tx_guard = Some(control_tx);
-    drop(tx_guard);
+    thread::spawn(move || {
+        let clear_listen_state = || {
+            if let Some(state) = app.try_state::<AppState>() {
+                if let Ok(mut guard) = state.listen_control.lock() {
+                    *guard = None;
+                }
+            }
+        };
 
-    let worker_app = app.clone();
-
-    std::thread::spawn(move || {
         let host = cpal::default_host();
-        let Some(device) = host.default_output_device() else {
-            emit_transcript(
-                &worker_app,
-                "No output audio device found.".to_string(),
-                true,
-            );
-            if let Ok(mut tx) = CAPTURE_TX.get_or_init(|| Mutex::new(None)).lock() {
-                *tx = None;
+        let device = match host.default_output_device() {
+            Some(device) => device,
+            None => {
+                emit_stt_error(&app, "No system output device found for loopback capture.".into());
+                clear_listen_state();
+                return;
             }
-            return;
         };
 
-        let Ok(output_config) = device.default_output_config() else {
-            emit_transcript(
-                &worker_app,
-                "Unable to read output device config.".to_string(),
-                true,
-            );
-            if let Ok(mut tx) = CAPTURE_TX.get_or_init(|| Mutex::new(None)).lock() {
-                *tx = None;
+        let output_config = match device.default_output_config() {
+            Ok(config) => config,
+            Err(err) => {
+                emit_stt_error(&app, format!("Unable to read output device config: {err}"));
+                clear_listen_state();
+                return;
             }
-            return;
         };
 
-        let sample_rate = output_config.sample_rate().0 as f32;
-        let Some(recognizer) = Recognizer::new(&model, sample_rate) else {
-            emit_transcript(
-                &worker_app,
-                "Failed to create Vosk recognizer.".to_string(),
-                true,
-            );
-            if let Ok(mut tx) = CAPTURE_TX.get_or_init(|| Mutex::new(None)).lock() {
-                *tx = None;
-            }
-            return;
-        };
-
-        let recognizer = Arc::new(Mutex::new(recognizer));
+        let source_sample_rate = output_config.sample_rate().0;
         let stream_config = output_config.config();
         let sample_format = output_config.sample_format();
+
         let stream = match build_loopback_stream(
             &device,
             &stream_config,
             sample_format,
-            recognizer,
-            worker_app.clone(),
+            source_sample_rate,
+            inference_tx.clone(),
         ) {
             Ok(stream) => stream,
             Err(err) => {
-                emit_transcript(&worker_app, err, true);
-                if let Ok(mut tx) = CAPTURE_TX.get_or_init(|| Mutex::new(None)).lock() {
-                    *tx = None;
-                }
+                emit_stt_error(&app, err);
+                clear_listen_state();
                 return;
             }
         };
 
         if let Err(err) = stream.play() {
-            emit_transcript(&worker_app, format!("Failed to start stream: {err}"), true);
-            if let Ok(mut tx) = CAPTURE_TX.get_or_init(|| Mutex::new(None)).lock() {
-                *tx = None;
-            }
+            emit_stt_error(&app, format!("Failed to start audio stream: {err}"));
+            clear_listen_state();
             return;
         }
 
@@ -472,22 +530,73 @@ fn start_system_audio_transcription(
             }
         }
 
+        let _ = inference_tx.send(InferenceMessage::Stop);
         drop(stream);
-        if let Ok(mut tx) = CAPTURE_TX.get_or_init(|| Mutex::new(None)).lock() {
-            *tx = None;
-        }
+        clear_listen_state();
     });
 
     Ok(())
 }
 
 #[tauri::command]
-fn stop_system_audio_transcription() -> Result<(), String> {
-    let tx_store = CAPTURE_TX.get_or_init(|| Mutex::new(None));
-    let mut tx_guard = tx_store
+async fn initialize_whisper(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    model_path: String,
+) -> Result<(), String> {
+    let resolved = resolve_whisper_model_path(&app, model_path)?;
+    let ctx = tokio::task::spawn_blocking(move || load_whisper_context(&resolved))
+        .await
+        .map_err(|err| format!("Whisper initialization task failed: {err}"))??;
+
+    let mut guard = state
+        .whisper
         .lock()
-        .map_err(|_| "Failed to lock capture state".to_string())?;
-    if let Some(tx) = tx_guard.take() {
+        .map_err(|_| "Whisper state lock poisoned".to_string())?;
+    *guard = Some(Arc::new(ctx));
+    Ok(())
+}
+
+#[tauri::command]
+async fn start_interview_listening(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let ctx = {
+        let guard = state
+            .whisper
+            .lock()
+            .map_err(|_| "Whisper state lock poisoned".to_string())?;
+        guard
+            .clone()
+            .ok_or_else(|| "Whisper is not initialized. Call initialize_whisper first.".to_string())?
+    };
+
+    let mut listen_guard = state
+        .listen_control
+        .lock()
+        .map_err(|_| "Listen state lock poisoned".to_string())?;
+    if listen_guard.is_some() {
+        return Ok(());
+    }
+
+    let (control_tx, control_rx) = mpsc::channel::<ControlMessage>();
+    *listen_guard = Some(control_tx);
+    drop(listen_guard);
+
+    let worker_app = app.clone();
+    start_listening_thread(worker_app, ctx, control_rx)?;
+
+    Ok(())
+}
+
+#[tauri::command]
+async fn stop_interview_listening(state: State<'_, AppState>) -> Result<(), String> {
+    let mut listen_guard = state
+        .listen_control
+        .lock()
+        .map_err(|_| "Listen state lock poisoned".to_string())?;
+    if let Some(tx) = listen_guard.take() {
         let _ = tx.send(ControlMessage::Stop);
     }
     Ok(())
@@ -496,6 +605,7 @@ fn stop_system_audio_transcription() -> Result<(), String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(AppState::default())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
@@ -504,11 +614,8 @@ pub fn run() {
                 .get_webview_window("main")
                 .ok_or("main window not found")?;
 
-            // Hide the window from screen capture (display mirroring, OBS, etc.).
             window.set_content_protected(true)?;
 
-            // On Windows, also hide from the taskbar and Alt-Tab switcher
-            // by adding the WS_EX_TOOLWINDOW extended style to the HWND.
             #[cfg(target_os = "windows")]
             {
                 let hwnd_raw = window.hwnd()?.0 as isize;
@@ -523,8 +630,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_api_keys,
-            start_system_audio_transcription,
-            stop_system_audio_transcription
+            initialize_whisper,
+            start_interview_listening,
+            stop_interview_listening
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

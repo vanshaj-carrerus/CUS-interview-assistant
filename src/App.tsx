@@ -8,30 +8,55 @@ import { checkAndInstallUpdates } from "./lib/appUpdater";
 import { ensureApiKeysLoaded } from "./lib/apiConfig";
 import {
   buildInterviewCoachPrompt,
+  buildRefineCoachPrompt,
   coerceInterviewCoachJson,
   formatInterviewCoachJson,
   runMockInterviewPrompt,
+  type InterviewCoachJson,
+  type RefineKind,
 } from "./lib/interviewAiEngine";
 import { tauriErrorMessage } from "./lib/tauriError";
-
-type TranscriptPayload = {
-  text: string;
-  is_final: boolean;
-};
 
 type ChatMessage = {
   id: string;
   role: "user" | "assistant";
   content: string;
   model?: string;
+  /** Recruiter transcript this assistant reply is based on. */
+  sourceTranscript?: string;
+  coach?: InterviewCoachJson;
 };
 
-/** Join final + streaming partial for the textarea. Do not trim — trim breaks trailing spaces while typing. */
-function composeLiveTranscript(finalText: string, partial: string): string {
-  if (!partial) return finalText;
-  if (!finalText) return partial;
-  return `${finalText} ${partial}`;
+function findLastAssistantIndex(messages: ChatMessage[]): number {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "assistant") return i;
+  }
+  return -1;
 }
+
+function getLastCoachTurn(messages: ChatMessage[]): {
+  assistantId: string;
+  transcript: string;
+  coach: InterviewCoachJson | undefined;
+} | null {
+  const idx = findLastAssistantIndex(messages);
+  if (idx === -1) return null;
+  const assistant = messages[idx];
+  const transcript = assistant.sourceTranscript?.trim();
+  if (!transcript) return null;
+  return {
+    assistantId: assistant.id,
+    transcript,
+    coach: assistant.coach,
+  };
+}
+
+type SttErrorPayload = {
+  message: string;
+};
+
+/** Empty string lets the backend resolve bundled `models/whisper/*.bin`. */
+const DEFAULT_WHISPER_MODEL_PATH = "";
 
 /** Inner limits — keep in sync with `src-tauri/tauri.conf.json` window `minWidth` / `minHeight`. */
 const WINDOW_MIN_INNER = { width: 340, height: 260 };
@@ -41,15 +66,20 @@ function isTauriRuntime(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
+async function bootWhisperStt(): Promise<void> {
+  await invoke("initialize_whisper", { modelPath: DEFAULT_WHISPER_MODEL_PATH });
+  await invoke("start_interview_listening");
+}
+
 function App() {
   const [isListening, setIsListening] = useState(false);
   const [isSending, setIsSending] = useState(false);
   const [captureMode, setCaptureMode] = useState("Idle");
   const [transcript, setTranscript] = useState("");
-  const [partialTranscript, setPartialTranscript] = useState("");
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [errorMessage, setErrorMessage] = useState("");
   const [isWindowCompact, setIsWindowCompact] = useState(false);
+  const [whisperReady, setWhisperReady] = useState(false);
   const savedInnerLogicalSizeRef = useRef<{ width: number; height: number } | null>(null);
 
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -85,29 +115,49 @@ function App() {
   }, []);
 
   useEffect(() => {
-    let unlisten: UnlistenFn | null = null;
+    if (!isTauriRuntime()) return;
 
-    const bindTranscriptEvent = async () => {
-      unlisten = await listen<TranscriptPayload>("transcript-event", (event) => {
-        const payload = event.payload;
-        if (!payload?.text) return;
+    let sttUnlisten: UnlistenFn | null = null;
+    let errorUnlisten: UnlistenFn | null = null;
 
-        if (payload.is_final) {
-          setTranscript((prev) => `${prev} ${payload.text}`.trim());
-          setPartialTranscript("");
-        } else {
-          setPartialTranscript(payload.text.trim());
-        }
+    const setup = async () => {
+      try {
+        setCaptureMode("Loading local Whisper model…");
+        await bootWhisperStt();
+        setWhisperReady(true);
+        setIsListening(true);
+        setCaptureMode("Local Whisper · system audio");
+        setErrorMessage("");
+      } catch (error) {
+        const message = tauriErrorMessage(
+          error,
+          "Failed to initialize local speech recognition.",
+        );
+        setErrorMessage(message);
+        setWhisperReady(false);
+        setIsListening(false);
+        setCaptureMode("Idle");
+      }
+
+      sttUnlisten = await listen<string>("stt-result", (event) => {
+        const text = event.payload?.trim();
+        if (!text) return;
+        setTranscript((prev) => (prev ? `${prev} ${text}` : text).trim());
+      });
+
+      errorUnlisten = await listen<SttErrorPayload>("stt-error", (event) => {
+        const message = event.payload?.message?.trim();
+        if (!message) return;
+        setErrorMessage(message);
       });
     };
 
-    void bindTranscriptEvent();
+    void setup();
 
     return () => {
-      if (unlisten) {
-        void unlisten();
-      }
-      void invoke("stop_system_audio_transcription");
+      if (sttUnlisten) void sttUnlisten();
+      if (errorUnlisten) void errorUnlisten();
+      void invoke("stop_interview_listening");
     };
   }, []);
 
@@ -115,39 +165,86 @@ function App() {
     const node = scrollRef.current;
     if (!node) return;
     node.scrollTo({ top: node.scrollHeight, behavior: "smooth" });
-  }, [transcript, partialTranscript, chatMessages, isSending]);
+  }, [transcript, chatMessages, isSending]);
 
-  const startListening = async () => {
+  const startListening = useCallback(async () => {
+    if (!isTauriRuntime()) return;
     try {
       setErrorMessage("");
-      setCaptureMode("Starting system loopback capture...");
-      await invoke("start_system_audio_transcription");
+      setCaptureMode("Starting local Whisper capture…");
+      if (!whisperReady) {
+        await invoke("initialize_whisper", { modelPath: DEFAULT_WHISPER_MODEL_PATH });
+        setWhisperReady(true);
+      }
+      await invoke("start_interview_listening");
       setIsListening(true);
-      setCaptureMode("System audio capture active");
+      setCaptureMode("Local Whisper · system audio");
     } catch (error) {
       const message = tauriErrorMessage(error, "Failed to start listening.");
       setErrorMessage(message);
       setIsListening(false);
       setCaptureMode("Idle");
     }
-  };
+  }, [whisperReady]);
 
-  const stopListening = async () => {
-    await invoke("stop_system_audio_transcription");
+  const stopListening = useCallback(async () => {
+    if (!isTauriRuntime()) return;
+    await invoke("stop_interview_listening");
     setIsListening(false);
     setCaptureMode("Stopped");
-  };
+  }, []);
 
-  const clearTranscript = () => {
+  const clearAll = useCallback(() => {
     setTranscript("");
-    setPartialTranscript("");
     setChatMessages([]);
     setErrorMessage("");
-    console.log("[Transcript Cleared]");
-  };
+  }, []);
 
-  const sendToAi = async () => {
-    const snapshot = composeLiveTranscript(transcript, partialTranscript).trim();
+  const appendAssistantReply = useCallback(
+    (snapshot: string, coach: InterviewCoachJson, model: string) => {
+      const assistantText = formatInterviewCoachJson(coach);
+      setChatMessages((prev) => [
+        ...prev,
+        {
+          id: crypto.randomUUID(),
+          role: "assistant",
+          content: assistantText,
+          model,
+          sourceTranscript: snapshot,
+          coach,
+        },
+      ]);
+    },
+    [],
+  );
+
+  const replaceAssistantReply = useCallback(
+    (assistantId: string, coach: InterviewCoachJson, model: string) => {
+      const assistantText = formatInterviewCoachJson(coach);
+      setChatMessages((prev) =>
+        prev.map((msg) =>
+          msg.id === assistantId
+            ? {
+                ...msg,
+                content: assistantText,
+                model,
+                coach,
+              }
+            : msg,
+        ),
+      );
+    },
+    [],
+  );
+
+  const requestCoach = useCallback(async (prompt: string) => {
+    const { data, model } = await runMockInterviewPrompt<unknown>(prompt);
+    const coach = coerceInterviewCoachJson(data);
+    return { coach, model };
+  }, []);
+
+  const sendToAi = useCallback(async () => {
+    const snapshot = transcript.trim();
     if (!snapshot) {
       setErrorMessage(
         "Add what the recruiter said (listen, type, or paste), then send to AI.",
@@ -158,38 +255,103 @@ function App() {
     const userId = crypto.randomUUID();
     setChatMessages((prev) => [...prev, { id: userId, role: "user", content: snapshot }]);
     setTranscript("");
-    setPartialTranscript("");
     setIsSending(true);
     try {
       const prompt = buildInterviewCoachPrompt(snapshot);
-      const { data, model } = await runMockInterviewPrompt<unknown>(prompt);
-      const coach = coerceInterviewCoachJson(data);
-      const assistantText = formatInterviewCoachJson(coach);
-      setChatMessages((prev) => [
-        ...prev,
-        {
-          id: crypto.randomUUID(),
-          role: "assistant",
-          content: assistantText,
-          model,
-        },
-      ]);
-      console.log("[Send To AI]", snapshot, model);
+      const { coach, model } = await requestCoach(prompt);
+      appendAssistantReply(snapshot, coach, model);
     } catch (err) {
       const message =
         err instanceof Error ? err.message : "AI request failed. Check API keys in .env.";
       setErrorMessage(message);
-      console.error("[Send To AI]", err);
     } finally {
       setIsSending(false);
     }
-  };
+  }, [transcript, requestCoach, appendAssistantReply]);
 
-  const hasTranscript =
-    transcript.trim().length > 0 || partialTranscript.trim().length > 0;
+  const regenerateLastAnswer = useCallback(async () => {
+    const turn = getLastCoachTurn(chatMessages);
+    if (!turn || isSending) return;
+    setErrorMessage("");
+    setIsSending(true);
+    try {
+      const prompt = buildInterviewCoachPrompt(turn.transcript);
+      const { coach, model } = await requestCoach(prompt);
+      replaceAssistantReply(turn.assistantId, coach, model);
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "AI request failed. Check API keys in .env.";
+      setErrorMessage(message);
+    } finally {
+      setIsSending(false);
+    }
+  }, [chatMessages, isSending, requestCoach, replaceAssistantReply]);
+
+  const refineLastAnswer = useCallback(
+    async (kind: RefineKind) => {
+      const turn = getLastCoachTurn(chatMessages);
+      if (!turn?.coach || isSending) return;
+      setErrorMessage("");
+      setIsSending(true);
+      try {
+        const prompt = buildRefineCoachPrompt(turn.transcript, turn.coach, kind);
+        const { coach, model } = await requestCoach(prompt);
+        replaceAssistantReply(turn.assistantId, coach, model);
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : "AI request failed. Check API keys in .env.";
+        setErrorMessage(message);
+      } finally {
+        setIsSending(false);
+      }
+    },
+    [chatMessages, isSending, requestCoach, replaceAssistantReply],
+  );
+
+  const hasTranscript = transcript.trim().length > 0;
+  const lastAssistantIndex = findLastAssistantIndex(chatMessages);
+  const lastCoachTurn = getLastCoachTurn(chatMessages);
+  const canRegenerate = !!lastCoachTurn && !isSending;
+  const canRefine = !!lastCoachTurn?.coach && !isSending;
+
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      const mod = e.ctrlKey || e.metaKey;
+      if (!mod) return;
+
+      if (e.key === "Enter" && !e.shiftKey) {
+        if (hasTranscript && !isSending) {
+          e.preventDefault();
+          void sendToAi();
+        }
+        return;
+      }
+
+      if (e.key === "l" || e.key === "L") {
+        e.preventDefault();
+        if (isListening) void stopListening();
+        else void startListening();
+        return;
+      }
+
+      if (e.key === "C" && e.shiftKey) {
+        e.preventDefault();
+        clearAll();
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [
+    hasTranscript,
+    isSending,
+    isListening,
+    sendToAi,
+    clearAll,
+    startListening,
+    stopListening,
+  ]);
   const showEmptyState = chatMessages.length === 0 && !hasTranscript;
-
-  const liveTranscriptText = composeLiveTranscript(transcript, partialTranscript);
 
   return (
     <div className="flex h-full max-h-[calc(100vh-30px)] w-full flex-col overflow-hidden text-slate-100">
@@ -208,7 +370,7 @@ function App() {
           <div className="mx-auto flex max-w-3xl flex-col gap-4">
             {showEmptyState && <EmptyState />}
 
-            {chatMessages.map((msg) =>
+            {chatMessages.map((msg, index) =>
               msg.role === "user" ? (
                 <UserBubble
                   key={msg.id}
@@ -218,21 +380,28 @@ function App() {
                   onChange={() => {}}
                 />
               ) : (
-                <AiBubble key={msg.id} text={msg.content} model={msg.model} />
+                <AiBubble
+                  key={msg.id}
+                  text={msg.content}
+                  model={msg.model}
+                  isLast={index === lastAssistantIndex}
+                  canRegenerate={canRegenerate}
+                  canRefine={canRefine}
+                  onRegenerate={() => void regenerateLastAnswer()}
+                  onRefine={(kind) => void refineLastAnswer(kind)}
+                />
               ),
             )}
 
             {isSending && <TypingBubble />}
 
             <UserBubble
-              value={liveTranscriptText}
+              value={transcript}
               readOnly={false}
-              isPartialActive={partialTranscript.length > 0}
-              placeholder="Live transcript appears here while listening. If capture is not working, type or paste what you heard, then Send to AI."
-              onChange={(next) => {
-                setTranscript(next);
-                setPartialTranscript("");
-              }}
+              isPartialActive={isListening}
+              placeholder="Whisper transcripts appear here after each pause. Type or paste, then Send to AI (Ctrl+Enter)."
+              onChange={setTranscript}
+              onSubmit={() => void sendToAi()}
             />
           </div>
         </div>
@@ -248,11 +417,11 @@ function App() {
       <Composer
         isListening={isListening}
         isSending={isSending}
-        canSend={liveTranscriptText.trim().length > 0}
+        canSend={hasTranscript}
         onStart={startListening}
         onStop={stopListening}
         onSend={sendToAi}
-        onClear={clearTranscript}
+        onClear={clearAll}
       />
     </div>
   );
@@ -351,12 +520,24 @@ function EmptyState() {
           <span className="rounded bg-white/5 px-1.5 py-0.5 text-slate-200">
             Listen
           </span>{" "}
-          to capture system audio, or type or paste the recruiter question in
-          the box below if transcription is unavailable. Then use{" "}
+          to capture system audio with local Whisper, or type or paste the
+          recruiter question in the box below. Then use{" "}
           <span className="rounded bg-white/5 px-1.5 py-0.5 text-slate-200">
             Send to AI
           </span>{" "}
-          for a drafted answer.
+          for a drafted answer. Shortcuts:{" "}
+          <span className="rounded bg-white/5 px-1.5 py-0.5 text-slate-200">
+            Ctrl+Enter
+          </span>{" "}
+          send,{" "}
+          <span className="rounded bg-white/5 px-1.5 py-0.5 text-slate-200">
+            Ctrl+L
+          </span>{" "}
+          listen,{" "}
+          <span className="rounded bg-white/5 px-1.5 py-0.5 text-slate-200">
+            Ctrl+Shift+C
+          </span>{" "}
+          clear all.
         </p>
       </div>
     </div>
@@ -368,12 +549,14 @@ function UserBubble({
   readOnly,
   isPartialActive,
   onChange,
+  onSubmit,
   placeholder = "Transcript will appear here…",
 }: {
   value: string;
   readOnly?: boolean;
   isPartialActive: boolean;
   onChange: (next: string) => void;
+  onSubmit?: () => void;
   placeholder?: string;
 }) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -410,6 +593,13 @@ function UserBubble({
               ref={textareaRef}
               value={value}
               onChange={(e) => onChange(e.currentTarget.value)}
+              onKeyDown={(e) => {
+                const mod = e.ctrlKey || e.metaKey;
+                if (mod && e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  onSubmit?.();
+                }
+              }}
               placeholder={placeholder}
               spellCheck={false}
               rows={3}
@@ -444,16 +634,39 @@ function TypingBubble() {
   );
 }
 
-function AiBubble({ text }: { text: string; model?: string }) {
+function AiBubble({
+  text,
+  model,
+  isLast,
+  canRegenerate,
+  canRefine,
+  onRegenerate,
+  onRefine,
+}: {
+  text: string;
+  model?: string;
+  isLast?: boolean;
+  canRegenerate?: boolean;
+  canRefine?: boolean;
+  onRegenerate?: () => void;
+  onRefine?: (kind: RefineKind) => void;
+}) {
   const body = text.trim() ? text : "(No text in AI response.)";
+  const showActions = isLast && (canRegenerate || canRefine);
+
   return (
     <div className="flex w-full min-w-0 justify-start">
       <div className="flex max-w-[88%] min-w-0 flex-col items-start gap-1">
         <div className="flex flex-wrap items-center gap-2 pl-1 text-[11px] text-slate-400">
-          <div className="grid size-6 place-items-center rounded-full bg-linear-to-br from-primary to-secondary text-[10px] font-bold text-white"> 
+          <div className="grid size-6 place-items-center rounded-full bg-linear-to-br from-primary to-secondary text-[10px] font-bold text-white">
             <SparkleIcon className="size-3" />
           </div>
           <span>Assistant</span>
+          {model && (
+            <span className="truncate text-slate-500" title={model}>
+              · {model}
+            </span>
+          )}
         </div>
         <div className="w-full min-w-0 rounded-2xl rounded-tl-sm border border-white/5 bg-surface-2/70 px-4 py-3 text-[14px] leading-relaxed text-slate-100 shadow-lg shadow-black/20 backdrop-blur">
           <p
@@ -462,9 +675,47 @@ function AiBubble({ text }: { text: string; model?: string }) {
           >
             {body}
           </p>
+          {showActions && (
+            <div className="mt-3 flex flex-wrap gap-1.5 border-t border-white/5 pt-3">
+              {canRegenerate && (
+                <RefineButton label="Regenerate" onClick={() => onRegenerate?.()} />
+              )}
+              {canRefine && (
+                <>
+                  <RefineButton
+                    label="Shorter"
+                    onClick={() => onRefine?.("shorter")}
+                  />
+                  <RefineButton
+                    label="More technical"
+                    onClick={() => onRefine?.("technical")}
+                  />
+                  <RefineButton label="STAR" onClick={() => onRefine?.("star")} />
+                </>
+              )}
+            </div>
+          )}
         </div>
       </div>
     </div>
+  );
+}
+
+function RefineButton({
+  label,
+  onClick,
+}: {
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="rounded-full bg-white/5 px-2.5 py-1 text-[11px] font-medium text-slate-300 ring-1 ring-white/10 transition hover:bg-white/10 active:scale-[0.98]"
+    >
+      {label}
+    </button>
   );
 }
 
@@ -514,6 +765,7 @@ function Composer({
         <button
           type="button"
           onClick={isListening ? onStop : onStart}
+          title={isListening ? "Stop listening" : "Start listening (Ctrl+L)"}
           className={
             "group inline-flex items-center gap-2 rounded-full px-3.5 py-2 text-[13px] font-medium transition active:scale-[0.98] " +
             (isListening
@@ -540,16 +792,18 @@ function Composer({
           type="button"
           onClick={onClear}
           className="inline-flex items-center gap-1.5 rounded-full bg-white/5 px-3 py-2 text-[13px] font-medium text-slate-300 ring-1 ring-white/10 transition hover:bg-white/10 active:scale-[0.98]"
-          aria-label="Clear conversation"
+          title="Clear transcript and chat (Ctrl+Shift+C)"
+          aria-label="Clear all"
         >
           <TrashIcon className="size-4" />
-          <span className="hidden sm:inline">Clear</span>
+          <span className="hidden sm:inline">Clear all</span>
         </button>
 
         <button
           type="button"
           onClick={onSend}
           disabled={isSending || !canSend}
+          title="Send to AI (Ctrl+Enter)"
           className="group inline-flex cursor-pointer items-center gap-2 rounded-full bg-linear-to-br from-primary to-secondary px-4 py-2 text-[13px] font-semibold text-primary-foreground shadow-lg shadow-primary/25 transition hover:brightness-110 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-50 disabled:shadow-none disabled:hover:brightness-100"
         >
           {isSending ? (

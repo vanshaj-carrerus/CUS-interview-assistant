@@ -1,0 +1,4 @@
+# whisper-rs-sys uses bindgen + libclang. Point at your LLVM install.
+[env]
+LIBCLANG_PATH = "C:\\Program Files\\LLVM\\bin"
+BINDGEN_EXTRA_CLANG_ARGS = "--target=x86_64-pc-windows-msvc"

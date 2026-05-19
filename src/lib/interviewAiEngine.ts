@@ -33,6 +33,14 @@ export function parseJsonSafely<T>(raw: string): T {
   return JSON.parse(cleaned) as T;
 }
 
+const JSON_SHAPE_INSTRUCTIONS = `Return ONLY valid JSON (no markdown fences) with this exact shape:
+{
+  "headline": "short label for what was asked",
+  "bullets": ["3-5 concise talking points"],
+  "draftAnswer": "first-person answer they can say aloud, 2-5 sentences",
+  "caveats": "optional one line if transcript is unclear or assumptions were made; omit or use empty string"  
+}`;
+
 export function buildInterviewCoachPrompt(transcript: string): string {
   return `You are an interview coach helping a candidate respond live.
 The following is what was heard from the recruiter (may be noisy or partial).
@@ -42,13 +50,38 @@ Transcript:
 ${transcript.trim()}
 """
 
-Return ONLY valid JSON (no markdown fences) with this exact shape:
-{
-  "headline": "short label for what was asked",
-  "bullets": ["3-5 concise talking points"],
-  "draftAnswer": "first-person answer they can say aloud, 2-5 sentences",
-  "caveats": "optional one line if transcript is unclear or assumptions were made; omit or use empty string"  
-}`;
+${JSON_SHAPE_INSTRUCTIONS}`;
+}
+
+export type RefineKind = "shorter" | "technical" | "star";
+
+const REFINE_INSTRUCTIONS: Record<RefineKind, string> = {
+  shorter:
+    "Make the answer more concise: fewer bullets (2-4), shorter draftAnswer (1-3 sentences). Keep the same meaning.",
+  technical:
+    "Make the answer more technical: use precise terminology, relevant tools/frameworks, and concrete engineering detail where appropriate.",
+  star: "Rewrite draftAnswer using STAR (Situation, Task, Action, Result). Bullets should support that structure.",
+};
+
+export function buildRefineCoachPrompt(
+  transcript: string,
+  previous: InterviewCoachJson,
+  kind: RefineKind,
+): string {
+  const prevJson = JSON.stringify(previous, null, 2);
+  return `You are an interview coach helping a candidate respond live.
+
+Recruiter question (transcript):
+"""
+${transcript.trim()}
+"""
+
+Previous coach response (JSON):
+${prevJson}
+
+Refinement task: ${REFINE_INSTRUCTIONS[kind]}
+
+${JSON_SHAPE_INSTRUCTIONS}`;
 }
 
 export function formatInterviewCoachJson(data: InterviewCoachJson): string {
