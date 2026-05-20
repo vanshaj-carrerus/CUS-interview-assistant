@@ -37,18 +37,59 @@ const JSON_SHAPE_INSTRUCTIONS = `Return ONLY valid JSON (no markdown fences) wit
 {
   "headline": "short label for what was asked",
   "bullets": ["3-5 concise talking points"],
-  "draftAnswer": "first-person answer they can say aloud, 2-5 sentences",
+  "draftAnswer": "first-person answer they can say aloud, 2-5 sentences (longer if code/examples are needed)",
   "caveats": "optional one line if transcript is unclear or assumptions were made; omit or use empty string"  
 }`;
 
-export function buildInterviewCoachPrompt(transcript: string): string {
-  return `You are an interview coach helping a candidate respond live.
+const CODING_INSTRUCTION = `If the recruiter question asks for code, an algorithm, implementation details, live coding, or a concrete technical example, include clear code or pseudocode in draftAnswer (and supporting bullets). Use fenced markdown code blocks when showing code.`;
+
+export type CoachContext = {
+  resumeText?: string;
+};
+
+function resumeSection(resumeText?: string): string {
+  const trimmed = resumeText?.trim();
+  if (!trimmed) return "";
+  return `
+Candidate resume (provided by the candidate):
+"""
+${trimmed}
+"""
+
+Resume rules:
+- Use resume details ONLY when the recruiter question is about the candidate's background, experience, projects, skills, education, or roles that appear on the resume.
+- Ground experience and project answers in facts from the resume when relevant; do not invent employers, dates, technologies, or projects not listed.
+- If the question is general, behavioral but not resume-specific, or unrelated to the resume, answer without citing resume details.
+- If the question asks about experience not on the resume, say so honestly and answer with transferable skills or general knowledge instead of fabricating resume items.
+`;
+}
+
+function coachGuidelines(context?: CoachContext): string {
+  const hasResume = !!context?.resumeText?.trim();
+  const lines = [
+    "You are an interview coach helping a candidate respond live.",
+    CODING_INSTRUCTION,
+  ];
+  if (hasResume) {
+    lines.push(
+      "When the question relates to the candidate's resume, personalize bullets and draftAnswer using only verified resume content.",
+    );
+  }
+  return lines.join("\n");
+}
+
+export function buildInterviewCoachPrompt(
+  transcript: string,
+  context?: CoachContext,
+): string {
+  return `${coachGuidelines(context)}
 The following is what was heard from the recruiter (may be noisy or partial).
 
 Transcript:
 """
 ${transcript.trim()}
 """
+${resumeSection(context?.resumeText)}
 
 ${JSON_SHAPE_INSTRUCTIONS}`;
 }
@@ -67,14 +108,16 @@ export function buildRefineCoachPrompt(
   transcript: string,
   previous: InterviewCoachJson,
   kind: RefineKind,
+  context?: CoachContext,
 ): string {
   const prevJson = JSON.stringify(previous, null, 2);
-  return `You are an interview coach helping a candidate respond live.
+  return `${coachGuidelines(context)}
 
 Recruiter question (transcript):
 """
 ${transcript.trim()}
 """
+${resumeSection(context?.resumeText)}
 
 Previous coach response (JSON):
 ${prevJson}

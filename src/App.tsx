@@ -2,7 +2,14 @@ import { LogicalSize } from "@tauri-apps/api/dpi";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type RefObject,
+} from "react";
 import "./App.css";
 import { checkAndInstallUpdates } from "./lib/appUpdater";
 import { ensureApiKeysLoaded } from "./lib/apiConfig";
@@ -12,9 +19,19 @@ import {
   coerceInterviewCoachJson,
   formatInterviewCoachJson,
   runMockInterviewPrompt,
+  type CoachContext,
   type InterviewCoachJson,
   type RefineKind,
 } from "./lib/interviewAiEngine";
+import {
+  clearStoredResume,
+  loadStoredResume,
+  formatResumePreview,
+  readResumeFile,
+  resumeCharCount,
+  saveStoredResume,
+  type StoredResume,
+} from "./lib/resume";
 import { tauriErrorMessage } from "./lib/tauriError";
 
 type ChatMessage = {
@@ -62,6 +79,15 @@ const DEFAULT_WHISPER_MODEL_PATH = "";
 const WINDOW_MIN_INNER = { width: 340, height: 260 };
 const WINDOW_DEFAULT_INNER = { width: 600, height: 600 };
 
+/** While listening, auto-send accumulated transcript after this much quiet time (ms). */
+const AUTO_SEND_SILENCE_MS = 5000;
+
+type SendToAiOptions = {
+  snapshot?: string;
+  /** Skip empty-state error toast (auto-send paths). */
+  silent?: boolean;
+};
+
 function isTauriRuntime(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
@@ -80,9 +106,38 @@ function App() {
   const [errorMessage, setErrorMessage] = useState("");
   const [isWindowCompact, setIsWindowCompact] = useState(false);
   const [whisperReady, setWhisperReady] = useState(false);
+  const [resume, setResume] = useState<StoredResume | null>(() => loadStoredResume());
+  const [resumePanelOpen, setResumePanelOpen] = useState(false);
+  const [resumePaste, setResumePaste] = useState("");
+  const [resumeBusy, setResumeBusy] = useState(false);
+  const resumeFileInputRef = useRef<HTMLInputElement>(null);
   const savedInnerLogicalSizeRef = useRef<{ width: number; height: number } | null>(null);
+  const transcriptRef = useRef(transcript);
+  const isListeningRef = useRef(isListening);
+  const isSendingRef = useRef(isSending);
+  const sendToAiRef = useRef<(options?: SendToAiOptions) => Promise<void>>(async () => {});
 
   const scrollRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    transcriptRef.current = transcript;
+  }, [transcript]);
+
+  useEffect(() => {
+    isListeningRef.current = isListening;
+  }, [isListening]);
+
+  useEffect(() => {
+    isSendingRef.current = isSending;
+  }, [isSending]);
+  const coachContext = useMemo<CoachContext>(
+    () => (resume?.text ? { resumeText: resume.text } : {}),
+    [resume?.text],
+  );
+  const coachContextRef = useRef(coachContext);
+  useEffect(() => {
+    coachContextRef.current = coachContext;
+  }, [coachContext]);
 
   const toggleWindowCompact = useCallback(async () => {
     if (!isTauriRuntime()) return;
@@ -189,6 +244,10 @@ function App() {
 
   const stopListening = useCallback(async () => {
     if (!isTauriRuntime()) return;
+    const snapshot = transcriptRef.current.trim();
+    if (snapshot && !isSendingRef.current) {
+      await sendToAiRef.current({ snapshot, silent: true });
+    }
     await invoke("stop_interview_listening");
     setIsListening(false);
     setCaptureMode("Stopped");
@@ -199,6 +258,54 @@ function App() {
     setChatMessages([]);
     setErrorMessage("");
   }, []);
+
+  const applyResume = useCallback((text: string, fileName: string) => {
+    const next = { text: text.trim(), fileName: fileName.trim() || "Resume" };
+    if (!next.text) return;
+    saveStoredResume(next.text, next.fileName);
+    setResume(next);
+    setResumePaste("");
+    setResumePanelOpen(false);
+    setErrorMessage("");
+  }, []);
+
+  const removeResume = useCallback(() => {
+    clearStoredResume();
+    setResume(null);
+    setResumePaste("");
+    setResumePanelOpen(false);
+  }, []);
+
+  const onResumeFile = useCallback(
+    async (file: File | null) => {
+      if (!file) return;
+      setResumeBusy(true);
+      setErrorMessage("");
+      try {
+        const text = await readResumeFile(file);
+        applyResume(text, file.name);
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : "Could not read resume file.";
+        setErrorMessage(message);
+      } finally {
+        setResumeBusy(false);
+        if (resumeFileInputRef.current) resumeFileInputRef.current.value = "";
+      }
+    },
+    [applyResume],
+  );
+
+  const savePastedResume = useCallback(() => {
+    const text = resumePaste.trim();
+    if (!text) {
+      setErrorMessage(
+        "Paste your resume text first, or upload a PDF, DOCX, TXT, or MD file.",
+      );
+      return;
+    }
+    applyResume(text, "Pasted resume");
+  }, [resumePaste, applyResume]);
 
   const appendAssistantReply = useCallback(
     (snapshot: string, coach: InterviewCoachJson, model: string) => {
@@ -243,31 +350,61 @@ function App() {
     return { coach, model };
   }, []);
 
-  const sendToAi = useCallback(async () => {
-    const snapshot = transcript.trim();
-    if (!snapshot) {
-      setErrorMessage(
-        "Add what the recruiter said (listen, type, or paste), then send to AI.",
-      );
-      return;
-    }
-    setErrorMessage("");
-    const userId = crypto.randomUUID();
-    setChatMessages((prev) => [...prev, { id: userId, role: "user", content: snapshot }]);
-    setTranscript("");
-    setIsSending(true);
-    try {
-      const prompt = buildInterviewCoachPrompt(snapshot);
-      const { coach, model } = await requestCoach(prompt);
-      appendAssistantReply(snapshot, coach, model);
-    } catch (err) {
-      const message =
-        err instanceof Error ? err.message : "AI request failed. Check API keys in .env.";
-      setErrorMessage(message);
-    } finally {
-      setIsSending(false);
-    }
-  }, [transcript, requestCoach, appendAssistantReply]);
+  const sendToAi = useCallback(
+    async (options?: SendToAiOptions) => {
+      const snapshot = (options?.snapshot ?? transcriptRef.current).trim();
+      if (!snapshot) {
+        if (!options?.silent) {
+          setErrorMessage(
+            "Add what the recruiter said (listen, type, or paste), then send to AI.",
+          );
+        }
+        return;
+      }
+      if (isSendingRef.current) return;
+
+      setErrorMessage("");
+      const userId = crypto.randomUUID();
+      setChatMessages((prev) => [...prev, { id: userId, role: "user", content: snapshot }]);
+      setTranscript("");
+      setIsSending(true);
+      try {
+        const prompt = buildInterviewCoachPrompt(
+          snapshot,
+          coachContextRef.current,
+        );
+        const { coach, model } = await requestCoach(prompt);
+        appendAssistantReply(snapshot, coach, model);
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : "AI request failed. Check API keys in .env.";
+        setErrorMessage(message);
+      } finally {
+        setIsSending(false);
+      }
+    },
+    [requestCoach, appendAssistantReply],
+  );
+
+  useEffect(() => {
+    sendToAiRef.current = sendToAi;
+  }, [sendToAi]);
+
+  /** Auto-send after silence while still listening for the next question. */
+  useEffect(() => {
+    if (!isListening || isSending) return;
+    const trimmed = transcript.trim();
+    if (!trimmed) return;
+
+    const timer = window.setTimeout(() => {
+      if (!isListeningRef.current || isSendingRef.current) return;
+      const latest = transcriptRef.current.trim();
+      if (!latest) return;
+      void sendToAiRef.current({ snapshot: latest, silent: true });
+    }, AUTO_SEND_SILENCE_MS);
+
+    return () => window.clearTimeout(timer);
+  }, [isListening, transcript, isSending]);
 
   const regenerateLastAnswer = useCallback(async () => {
     const turn = getLastCoachTurn(chatMessages);
@@ -275,7 +412,10 @@ function App() {
     setErrorMessage("");
     setIsSending(true);
     try {
-      const prompt = buildInterviewCoachPrompt(turn.transcript);
+      const prompt = buildInterviewCoachPrompt(
+        turn.transcript,
+        coachContextRef.current,
+      );
       const { coach, model } = await requestCoach(prompt);
       replaceAssistantReply(turn.assistantId, coach, model);
     } catch (err) {
@@ -294,7 +434,12 @@ function App() {
       setErrorMessage("");
       setIsSending(true);
       try {
-        const prompt = buildRefineCoachPrompt(turn.transcript, turn.coach, kind);
+        const prompt = buildRefineCoachPrompt(
+          turn.transcript,
+          turn.coach,
+          kind,
+          coachContextRef.current,
+        );
         const { coach, model } = await requestCoach(prompt);
         replaceAssistantReply(turn.assistantId, coach, model);
       } catch (err) {
@@ -360,6 +505,16 @@ function App() {
         captureMode={captureMode}
         isWindowCompact={isWindowCompact}
         onToggleWindowCompact={toggleWindowCompact}
+        resume={resume}
+        resumePanelOpen={resumePanelOpen}
+        resumePaste={resumePaste}
+        resumeBusy={resumeBusy}
+        resumeFileInputRef={resumeFileInputRef}
+        onToggleResumePanel={() => setResumePanelOpen((open) => !open)}
+        onResumePasteChange={setResumePaste}
+        onResumeFile={(file) => void onResumeFile(file)}
+        onSavePastedResume={savePastedResume}
+        onRemoveResume={removeResume}
       />
 
       <main className="relative flex-1 overflow-hidden">
@@ -432,14 +587,35 @@ function Header({
   captureMode,
   isWindowCompact,
   onToggleWindowCompact,
+  resume,
+  resumePanelOpen,
+  resumePaste,
+  resumeBusy,
+  resumeFileInputRef,
+  onToggleResumePanel,
+  onResumePasteChange,
+  onResumeFile,
+  onSavePastedResume,
+  onRemoveResume,
 }: {
   isListening: boolean;
   captureMode: string;
   isWindowCompact: boolean;
   onToggleWindowCompact: () => void;
+  resume: StoredResume | null;
+  resumePanelOpen: boolean;
+  resumePaste: string;
+  resumeBusy: boolean;
+  resumeFileInputRef: RefObject<HTMLInputElement | null>;
+  onToggleResumePanel: () => void;
+  onResumePasteChange: (value: string) => void;
+  onResumeFile: (file: File | null) => void;
+  onSavePastedResume: () => void;
+  onRemoveResume: () => void;
 }) {
   return (
-    <header className="flex shrink-0 items-center justify-between gap-3 border-b border-white/5 bg-surface/40 px-4 py-3 backdrop-blur-md">
+    <header className="relative shrink-0 border-b border-white/5 bg-surface/40 backdrop-blur-md">
+      <div className="flex items-center justify-between gap-3 px-4 py-3">
       <div className="flex min-w-0 items-center gap-3">
         <div className="relative grid size-9 shrink-0 place-items-center rounded-xl bg-linear-to-br from-primary to-secondary shadow-lg shadow-primary/25">
           <SparkleIcon className="size-5 text-white" />
@@ -455,17 +631,29 @@ function Header({
       </div>
 
       <div className="flex shrink-0 items-center gap-2">
+          <button
+            type="button"
+            onClick={onToggleResumePanel}
+            aria-expanded={resumePanelOpen}
+            className={
+              "inline-flex max-w-[9rem] items-center gap-1.5 truncate rounded-full border px-2.5 py-1 text-[11px] font-medium transition hover:bg-white/10 active:scale-[0.98] sm:max-w-[11rem] " +
+              (resume
+                ? "border-primary/40 bg-primary/10 text-primary"
+                : "border-white/10 bg-white/5 text-slate-300")
+            }
+          >
+            <DocumentIcon className="size-3.5 shrink-0" />
+            <span className="truncate">
+              {resume ? resume.fileName : "Resume (optional)"}
+            </span>
+          </button>
+
         {isTauriRuntime() && (
           <button
             type="button"
             onClick={() => {
               void onToggleWindowCompact();
             }}
-            title={
-              isWindowCompact
-                ? "Restore window size"
-                : "Shrink window to minimum size"
-            }
             aria-label={
               isWindowCompact
                 ? "Restore window size"
@@ -501,6 +689,82 @@ function Header({
           )}
         </span>
       </div>
+      </div>
+
+      {resumePanelOpen && (
+        <div className="border-t border-white/5 px-4 py-3">
+          <p className="text-[12px] leading-relaxed text-slate-400">
+            Optional: upload PDF, DOCX, TXT, or MD, or paste text. The AI uses
+            this for experience and project questions only.
+          </p>
+
+          {resume && (
+            <div className="mt-3 rounded-xl border border-primary/25 bg-primary/5 px-3 py-2">
+              <p className="text-[12px] font-medium text-primary">
+                Resume loaded for AI
+              </p>
+              <p className="mt-0.5 truncate text-[11px] text-slate-300">
+                {resume.fileName} ·{" "}
+                {resumeCharCount(resume.text).toLocaleString()} characters
+              </p>
+              <p className="mt-1 line-clamp-2 text-[11px] leading-relaxed text-slate-400">
+                {formatResumePreview(resume.text)}
+              </p>
+            </div>
+          )}
+
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <input
+              ref={resumeFileInputRef}
+              type="file"
+              accept=".pdf,.docx,.txt,.md,.text,.markdown,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain,text/markdown"
+              className="hidden"
+              onChange={(e) => onResumeFile(e.currentTarget.files?.[0] ?? null)}
+            />
+            <button
+              type="button"
+              disabled={resumeBusy}
+              onClick={() => resumeFileInputRef.current?.click()}
+              className="inline-flex items-center gap-1.5 rounded-full bg-white/5 px-3 py-1.5 text-[12px] font-medium text-slate-200 ring-1 ring-white/10 transition hover:bg-white/10 disabled:opacity-50"
+            >
+              {resumeBusy ? (
+                <SpinnerIcon className="size-3.5 animate-spin" />
+              ) : (
+                <UploadIcon className="size-3.5" />
+              )}
+              {resume ? "Replace resume" : "Upload resume"}
+            </button>
+            {resume && (
+              <button
+                type="button"
+                onClick={onRemoveResume}
+                className="inline-flex items-center gap-1.5 rounded-full bg-rose-500/10 px-3 py-1.5 text-[12px] font-medium text-rose-200 ring-1 ring-rose-400/30 transition hover:bg-rose-500/20"
+              >
+                <TrashIcon className="size-3.5" />
+                Delete resume
+              </button>
+            )}
+          </div>
+          <textarea
+            value={resumePaste}
+            onChange={(e) => onResumePasteChange(e.currentTarget.value)}
+            placeholder="Or paste resume text here…"
+            rows={4}
+            spellCheck={false}
+            className="mt-3 block w-full resize-y rounded-xl border border-white/10 bg-surface-2/80 px-3 py-2 text-[13px] leading-relaxed text-slate-100 placeholder:text-slate-500 focus:outline-none focus:ring-1 focus:ring-primary/40"
+          />
+          <div className="mt-2 flex justify-end">
+            <button
+              type="button"
+              onClick={onSavePastedResume}
+              disabled={!resumePaste.trim()}
+              className="rounded-full bg-linear-to-br from-primary to-secondary px-3 py-1.5 text-[12px] font-semibold text-primary-foreground shadow-md shadow-primary/20 transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {resume ? "Replace with paste" : "Save pasted resume"}
+            </button>
+          </div>
+        </div>
+      )}
     </header>
   );
 }
@@ -525,7 +789,11 @@ function EmptyState() {
           <span className="rounded bg-white/5 px-1.5 py-0.5 text-slate-200">
             Send to AI
           </span>{" "}
-          for a drafted answer. Shortcuts:{" "}
+          for a drafted answer. Optionally add your resume via{" "}
+          <span className="rounded bg-white/5 px-1.5 py-0.5 text-slate-200">
+            Resume (optional)
+          </span>{" "}
+          so experience questions use your real background. Shortcuts:{" "}
           <span className="rounded bg-white/5 px-1.5 py-0.5 text-slate-200">
             Ctrl+Enter
           </span>{" "}
@@ -636,7 +904,7 @@ function TypingBubble() {
 
 function AiBubble({
   text,
-  model,
+  model: _model,
   isLast,
   canRegenerate,
   canRefine,
@@ -662,11 +930,6 @@ function AiBubble({
             <SparkleIcon className="size-3" />
           </div>
           <span>Assistant</span>
-          {model && (
-            <span className="truncate text-slate-500" title={model}>
-              · {model}
-            </span>
-          )}
         </div>
         <div className="w-full min-w-0 rounded-2xl rounded-tl-sm border border-white/5 bg-surface-2/70 px-4 py-3 text-[14px] leading-relaxed text-slate-100 shadow-lg shadow-black/20 backdrop-blur">
           <p
@@ -765,7 +1028,6 @@ function Composer({
         <button
           type="button"
           onClick={isListening ? onStop : onStart}
-          title={isListening ? "Stop listening" : "Start listening (Ctrl+L)"}
           className={
             "group inline-flex items-center gap-2 rounded-full px-3.5 py-2 text-[13px] font-medium transition active:scale-[0.98] " +
             (isListening
@@ -792,7 +1054,6 @@ function Composer({
           type="button"
           onClick={onClear}
           className="inline-flex items-center gap-1.5 rounded-full bg-white/5 px-3 py-2 text-[13px] font-medium text-slate-300 ring-1 ring-white/10 transition hover:bg-white/10 active:scale-[0.98]"
-          title="Clear transcript and chat (Ctrl+Shift+C)"
           aria-label="Clear all"
         >
           <TrashIcon className="size-4" />
@@ -803,7 +1064,6 @@ function Composer({
           type="button"
           onClick={onSend}
           disabled={isSending || !canSend}
-          title="Send to AI (Ctrl+Enter)"
           className="group inline-flex cursor-pointer items-center gap-2 rounded-full bg-linear-to-br from-primary to-secondary px-4 py-2 text-[13px] font-semibold text-primary-foreground shadow-lg shadow-primary/25 transition hover:brightness-110 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-50 disabled:shadow-none disabled:hover:brightness-100"
         >
           {isSending ? (
@@ -970,7 +1230,6 @@ function CloseIcon({ className }: IconProps) {
   );
 }
 
-/** Titlebar-style minimize (shrinks to configured minimum inner size). */
 function MinimizeWindowIcon({ className }: IconProps) {
   return (
     <svg
@@ -1001,6 +1260,41 @@ function RestoreWindowIcon({ className }: IconProps) {
     >
       <path d="M8 6H6a2 2 0 0 0-2 2v8a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2v-2" />
       <rect x="10" y="4" width="10" height="10" rx="2" />
+    </svg>
+  );
+}
+
+function DocumentIcon({ className }: IconProps) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden
+    >
+      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z" />
+      <path d="M14 2v6h6M16 13H8M16 17H8M10 9H8" />
+    </svg>
+  );
+}
+
+function UploadIcon({ className }: IconProps) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden
+    >
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12" />
     </svg>
   );
 }
