@@ -11,7 +11,10 @@ import {
   type RefObject,
 } from "react";
 import "./App.css";
-import { checkAndInstallUpdates } from "./lib/appUpdater";
+import {
+  fetchUpdateAvailability,
+  installPendingUpdate,
+} from "./lib/appUpdater";
 import { ensureApiKeysLoaded } from "./lib/apiConfig";
 import {
   buildInterviewCoachPrompt,
@@ -110,6 +113,11 @@ function App() {
   const [resumePanelOpen, setResumePanelOpen] = useState(false);
   const [resumePaste, setResumePaste] = useState("");
   const [resumeBusy, setResumeBusy] = useState(false);
+  const [latestUpdateVersion, setLatestUpdateVersion] = useState<string | null>(
+    null,
+  );
+  const [isUpdating, setIsUpdating] = useState(false);
+  const [updateProgress, setUpdateProgress] = useState<number | null>(null);
   const resumeFileInputRef = useRef<HTMLInputElement>(null);
   const savedInnerLogicalSizeRef = useRef<{ width: number; height: number } | null>(null);
   const transcriptRef = useRef(transcript);
@@ -165,9 +173,30 @@ function App() {
   }, [isWindowCompact]);
 
   useEffect(() => {
-    void checkAndInstallUpdates();
     void ensureApiKeysLoaded();
+    if (!isTauriRuntime()) return;
+    void fetchUpdateAvailability().then((result) => {
+      if (result.available && result.latestVersion) {
+        setLatestUpdateVersion(result.latestVersion);
+      }
+    });
   }, []);
+
+  const installUpdate = useCallback(async () => {
+    if (!latestUpdateVersion || isUpdating) return;
+    setErrorMessage("");
+    setIsUpdating(true);
+    setUpdateProgress(0);
+    try {
+      await installPendingUpdate((percent) => setUpdateProgress(percent));
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "Update failed. Try again later.";
+      setErrorMessage(message);
+      setIsUpdating(false);
+      setUpdateProgress(null);
+    }
+  }, [latestUpdateVersion, isUpdating]);
 
   useEffect(() => {
     if (!isTauriRuntime()) return;
@@ -515,6 +544,10 @@ function App() {
         onResumeFile={(file) => void onResumeFile(file)}
         onSavePastedResume={savePastedResume}
         onRemoveResume={removeResume}
+        latestUpdateVersion={latestUpdateVersion}
+        isUpdating={isUpdating}
+        updateProgress={updateProgress}
+        onInstallUpdate={() => void installUpdate()}
       />
 
       <main className="relative flex-1 overflow-hidden">
@@ -597,6 +630,10 @@ function Header({
   onResumeFile,
   onSavePastedResume,
   onRemoveResume,
+  latestUpdateVersion,
+  isUpdating,
+  updateProgress,
+  onInstallUpdate,
 }: {
   isListening: boolean;
   captureMode: string;
@@ -612,6 +649,10 @@ function Header({
   onResumeFile: (file: File | null) => void;
   onSavePastedResume: () => void;
   onRemoveResume: () => void;
+  latestUpdateVersion: string | null;
+  isUpdating: boolean;
+  updateProgress: number | null;
+  onInstallUpdate: () => void;
 }) {
   return (
     <header className="relative shrink-0 border-b border-white/5 bg-surface/40 backdrop-blur-md">
@@ -631,6 +672,29 @@ function Header({
       </div>
 
       <div className="flex shrink-0 items-center gap-2">
+          {latestUpdateVersion && (
+            <button
+              type="button"
+              onClick={onInstallUpdate}
+              disabled={isUpdating}
+              className="inline-flex items-center gap-1.5 rounded-full border border-amber-400/40 bg-amber-500/15 px-2.5 py-1 text-[11px] font-semibold text-amber-200 transition hover:bg-amber-500/25 active:scale-[0.98] disabled:cursor-wait disabled:opacity-70"
+            >
+              {isUpdating ? (
+                <>
+                  <SpinnerIcon className="size-3.5 animate-spin" />
+                  {updateProgress != null
+                    ? `Updating ${updateProgress}%`
+                    : "Updating…"}
+                </>
+              ) : (
+                <>
+                  <DownloadIcon className="size-3.5 shrink-0" />
+                  Update v{latestUpdateVersion}
+                </>
+              )}
+            </button>
+          )}
+
           <button
             type="button"
             onClick={onToggleResumePanel}
@@ -1295,6 +1359,23 @@ function UploadIcon({ className }: IconProps) {
       aria-hidden
     >
       <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12" />
+    </svg>
+  );
+}
+
+function DownloadIcon({ className }: IconProps) {
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className={className}
+      aria-hidden
+    >
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3" />
     </svg>
   );
 }
