@@ -1,10 +1,4 @@
-import { GoogleGenerativeAI } from "@google/generative-ai";
-import {
-  apiKey,
-  ensureApiKeysLoaded,
-  hasAnyApiKey,
-  type ApiKeyName,
-} from "./apiConfig";
+import { runAuthenticatedInterviewPrompt } from "./auth";
 
 export type EngineResult<T> = {
   data: T;
@@ -18,10 +12,6 @@ export type InterviewCoachJson = {
   draftAnswer: string;
   caveats?: string;
 };
-
-function env(key: ApiKeyName): string | undefined {
-  return apiKey(key);
-}
 
 export function parseJsonSafely<T>(raw: string): T {
   const cleaned = raw
@@ -192,175 +182,8 @@ export function coerceInterviewCoachJson(data: unknown): InterviewCoachJson {
 }
 
 
-async function tryGemini<T>(prompt: string): Promise<EngineResult<T> | null> {
-  const key = env("VITE_GEMINI_API_KEY");
-  if (!key) return null;
-  try {
-    const genAI = new GoogleGenerativeAI(key);
-    const model = genAI.getGenerativeModel({
-      model: "gemini-2.0-flash",
-      generationConfig: { responseMimeType: "application/json" },
-    });
-    const result = await model.generateContent(prompt);
-    const text = result.response.text();
-    return {
-      data: parseJsonSafely<T>(text),
-      model: "gemini-2.0-flash",
-    };
-  } catch {
-    return null;
-  }
-}
-
-async function tryGroqChain<T>(prompt: string): Promise<EngineResult<T> | null> {
-  const key = env("VITE_GROQ_API_KEY");
-  if (!key) return null;
-  const models = [
-    "llama-3.3-70b-versatile",
-    "mixtral-8x7b-32768",
-    "llama-3.1-8b-instant",
-  ];
-
-  for (const modelId of models) {
-    try {
-      const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${key}`,
-        },
-        body: JSON.stringify({
-          model: modelId,
-          messages: [{ role: "user", content: prompt }],
-          response_format: { type: "json_object" },
-          temperature: 0.2,
-        }),
-      });
-      if (!res.ok) continue;
-      const body = (await res.json()) as {
-        choices?: Array<{ message?: { content?: string } }>;
-      };
-      const content = body.choices?.[0]?.message?.content;
-      if (!content) continue;
-      return {
-        data: parseJsonSafely<T>(content),
-        model: `groq-${modelId}`,
-      };
-    } catch {
-      // try next provider model
-    }
-  }
-  return null;
-}
-
-async function tryMistralChain<T>(prompt: string): Promise<EngineResult<T> | null> {
-  const key = env("VITE_MISTRAL_API_KEY");
-  if (!key) return null;
-  const models = [
-    "mistral-large-latest",
-    "mistral-medium-latest",
-    "mistral-small-latest",
-  ];
-
-  for (const modelId of models) {
-    try {
-      const res = await fetch("https://api.mistral.ai/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${key}`,
-        },
-        body: JSON.stringify({
-          model: modelId,
-          messages: [{ role: "user", content: prompt }],
-          response_format: { type: "json_object" },
-          temperature: 0.2,
-        }),
-      });
-      if (!res.ok) continue;
-      const body = (await res.json()) as {
-        choices?: Array<{ message?: { content?: string } }>;
-      };
-      const content = body.choices?.[0]?.message?.content;
-      if (!content) continue;
-      return {
-        data: parseJsonSafely<T>(content),
-        model: `mistral-${modelId}`,
-      };
-    } catch {
-      // try next provider model
-    }
-  }
-
-  return null;
-}
-
-async function tryOpenRouter<T>(prompt: string): Promise<EngineResult<T> | null> {
-  const key = env("VITE_OPENROUTER_API_KEY");
-  if (!key) return null;
-  const models = [
-    "google/gemma-4-26b-a4b-it:free",
-    "google/gemma-4-31b-it:free",
-    "nousresearch/hermes-3-llama-3.1-405b:free",
-  ];
-  for (const modelId of models) {
-    try {
-      const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${key}`,
-        },
-        body: JSON.stringify({
-          model: modelId,
-          messages: [{ role: "user", content: prompt }],
-          response_format: { type: "json_object" },
-          temperature: 0.2,
-        }),
-      });
-      if (!res.ok) continue;
-      const body = (await res.json()) as {
-        choices?: Array<{ message?: { content?: string } }>;
-      };
-      const content = body.choices?.[0]?.message?.content;
-      if (!content) continue;
-      return {
-        data: parseJsonSafely<T>(content),
-        model: `openrouter-${modelId}`,
-      };
-    } catch {
-      // try next provider model
-    }
-  }
-  return null;
-}
-
-const BACKEND_ORDER = ["Gemini", "Mistral", "Groq", "OpenRouter"] as const;
-
 export async function runMockInterviewPrompt<T>(
   prompt: string,
 ): Promise<EngineResult<T>> {
-  await ensureApiKeysLoaded();
-
-  if (!hasAnyApiKey()) {
-    throw new Error(
-      "No interview AI API keys are configured. Set at least one of VITE_GEMINI_API_KEY, VITE_MISTRAL_API_KEY, VITE_GROQ_API_KEY, VITE_OPENROUTER_API_KEY in src-tauri/.env (local) or as GitHub Actions secrets for releases.",
-    );
-  }
-
-  const gemini = await tryGemini<T>(prompt);
-  if (gemini) return gemini;
-
-  const mistral = await tryMistralChain<T>(prompt);
-  if (mistral) return mistral;
-
-  const groq = await tryGroqChain<T>(prompt);
-  if (groq) return groq;
-
-  const openRouter = await tryOpenRouter<T>(prompt);
-  if (openRouter) return openRouter;
-
-  throw new Error(
-    `All interview AI backends failed or are unavailable. Set at least one of VITE_GEMINI_API_KEY, VITE_MISTRAL_API_KEY, VITE_GROQ_API_KEY, VITE_OPENROUTER_API_KEY in src-tauri/.env, then check quotas and network. (Attempted in order: ${BACKEND_ORDER.join(" → ")}.)`,
-  );
+  return runAuthenticatedInterviewPrompt<T>(prompt);
 }

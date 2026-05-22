@@ -1,13 +1,16 @@
 {
   "name": "cus-interview-assistant",
   "private": true,
-  "version": "1.0.1",
+  "version": "1.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "tauri:build:production": "powershell -ExecutionPolicy Bypass -NoProfile -File ./scripts/tauri-build-production.ps1",
+    "tauri:build:signed": "powershell -ExecutionPolicy Bypass -NoProfile -File ./scripts/tauri-build-signed.ps1",
+    "test:api": "powershell -ExecutionPolicy Bypass -NoProfile -File ./scripts/test-production-auth.ps1"
   },
   "dependencies": {
     "@google/generative-ai": "^0.24.1",

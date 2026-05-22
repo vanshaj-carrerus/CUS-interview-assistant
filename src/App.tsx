@@ -15,7 +15,15 @@ import {
   fetchUpdateAvailability,
   installPendingUpdate,
 } from "./lib/appUpdater";
-import { ensureApiKeysLoaded } from "./lib/apiConfig";
+import {
+  getStoredToken,
+  logoutRemote,
+  refreshCurrentUser,
+  restoreSession,
+  type AuthSession,
+  type PublicUser,
+} from "./lib/auth";
+import { LoginScreen } from "./components/LoginScreen";
 import {
   buildInterviewCoachPrompt,
   buildRefineCoachPrompt,
@@ -101,6 +109,8 @@ async function bootWhisperStt(): Promise<void> {
 }
 
 function App() {
+  const [authSession, setAuthSession] = useState<AuthSession | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
   const [isListening, setIsListening] = useState(false);
   const [isSending, setIsSending] = useState(false);
   const [captureMode, setCaptureMode] = useState("Idle");
@@ -124,7 +134,6 @@ function App() {
   const isListeningRef = useRef(isListening);
   const isSendingRef = useRef(isSending);
   const sendToAiRef = useRef<(options?: SendToAiOptions) => Promise<void>>(async () => {});
-
   const scrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -173,7 +182,48 @@ function App() {
   }, [isWindowCompact]);
 
   useEffect(() => {
-    void ensureApiKeysLoaded();
+    void restoreSession()
+      .then((session) => setAuthSession(session))
+      .finally(() => setAuthLoading(false));
+  }, []);
+
+  useEffect(() => {
+    if (!authSession?.user || authSession.user.aiAllowed) return;
+
+    const poll = () => {
+      void refreshCurrentUser().then((user) => {
+        if (!user) {
+          setAuthSession(null);
+          return;
+        }
+        setAuthSession((prev) => (prev ? { ...prev, user } : null));
+      });
+    };
+
+    poll();
+    const id = window.setInterval(poll, 22_000);
+    return () => window.clearInterval(id);
+  }, [authSession?.token, authSession?.user?.aiAllowed]);
+
+  /** Pick up admin changes to aiAllowed, or detect revoked / superseded session. */
+  useEffect(() => {
+    if (!authSession) return;
+
+    const sync = () => {
+      void refreshCurrentUser().then((user) => {
+        if (!user) {
+          setAuthSession(null);
+          return;
+        }
+        setAuthSession((prev) => (prev ? { ...prev, user } : null));
+      });
+    };
+
+    window.addEventListener("focus", sync);
+    return () => window.removeEventListener("focus", sync);
+  }, [authSession?.token]);
+
+  useEffect(() => {
     if (!isTauriRuntime()) return;
     void fetchUpdateAvailability().then((result) => {
       if (result.available && result.latestVersion) {
@@ -379,8 +429,20 @@ function App() {
     return { coach, model };
   }, []);
 
+  const canUseAi = !!authSession?.user?.aiAllowed;
+
   const sendToAi = useCallback(
     async (options?: SendToAiOptions) => {
+      if (!canUseAi) {
+        if (!options?.silent) {
+          setErrorMessage(
+            authSession
+              ? "Your account does not have AI interview access yet. Contact an administrator."
+              : "Please sign in to use AI interview coaching.",
+          );
+        }
+        return;
+      }
       const snapshot = (options?.snapshot ?? transcriptRef.current).trim();
       if (!snapshot) {
         if (!options?.silent) {
@@ -408,11 +470,14 @@ function App() {
         const message =
           err instanceof Error ? err.message : "AI request failed. Check API keys in .env.";
         setErrorMessage(message);
+        if (!getStoredToken()) {
+          setAuthSession(null);
+        }
       } finally {
         setIsSending(false);
       }
     },
-    [requestCoach, appendAssistantReply],
+    [requestCoach, appendAssistantReply, canUseAi, authSession],
   );
 
   useEffect(() => {
@@ -421,7 +486,7 @@ function App() {
 
   /** Auto-send after silence while still listening for the next question. */
   useEffect(() => {
-    if (!isListening || isSending) return;
+    if (!canUseAi || !isListening || isSending) return;
     const trimmed = transcript.trim();
     if (!trimmed) return;
 
@@ -433,9 +498,10 @@ function App() {
     }, AUTO_SEND_SILENCE_MS);
 
     return () => window.clearTimeout(timer);
-  }, [isListening, transcript, isSending]);
+  }, [canUseAi, isListening, transcript, isSending]);
 
   const regenerateLastAnswer = useCallback(async () => {
+    if (!canUseAi) return;
     const turn = getLastCoachTurn(chatMessages);
     if (!turn || isSending) return;
     setErrorMessage("");
@@ -451,13 +517,17 @@ function App() {
       const message =
         err instanceof Error ? err.message : "AI request failed. Check API keys in .env.";
       setErrorMessage(message);
+      if (!getStoredToken()) {
+        setAuthSession(null);
+      }
     } finally {
       setIsSending(false);
     }
-  }, [chatMessages, isSending, requestCoach, replaceAssistantReply]);
+  }, [canUseAi, chatMessages, isSending, requestCoach, replaceAssistantReply]);
 
   const refineLastAnswer = useCallback(
     async (kind: RefineKind) => {
+      if (!canUseAi) return;
       const turn = getLastCoachTurn(chatMessages);
       if (!turn?.coach || isSending) return;
       setErrorMessage("");
@@ -475,12 +545,23 @@ function App() {
         const message =
           err instanceof Error ? err.message : "AI request failed. Check API keys in .env.";
         setErrorMessage(message);
+        if (!getStoredToken()) {
+          setAuthSession(null);
+        }
       } finally {
         setIsSending(false);
       }
     },
-    [chatMessages, isSending, requestCoach, replaceAssistantReply],
+    [canUseAi, chatMessages, isSending, requestCoach, replaceAssistantReply],
   );
+
+  const handleSignOut = useCallback(async () => {
+    await logoutRemote();
+    setAuthSession(null);
+    setChatMessages([]);
+    setTranscript("");
+    setErrorMessage("");
+  }, []);
 
   const hasTranscript = transcript.trim().length > 0;
   const lastAssistantIndex = findLastAssistantIndex(chatMessages);
@@ -494,7 +575,7 @@ function App() {
       if (!mod) return;
 
       if (e.key === "Enter" && !e.shiftKey) {
-        if (hasTranscript && !isSending) {
+        if (hasTranscript && !isSending && canUseAi) {
           e.preventDefault();
           void sendToAi();
         }
@@ -520,6 +601,7 @@ function App() {
     hasTranscript,
     isSending,
     isListening,
+    canUseAi,
     sendToAi,
     clearAll,
     startListening,
@@ -527,11 +609,33 @@ function App() {
   ]);
   const showEmptyState = chatMessages.length === 0 && !hasTranscript;
 
+  if (authLoading) {
+    return (
+      <div className="flex h-full min-h-[calc(100vh-30px)] items-center justify-center text-slate-400">
+        <SpinnerIcon className="size-6 animate-spin" />
+      </div>
+    );
+  }
+
+  if (!authSession) {
+    return (
+      <LoginScreen
+        onAuthenticated={(session) => {
+          setAuthSession(session);
+          setErrorMessage("");
+        }}
+      />
+    );
+  }
+
   return (
     <div className="flex h-full max-h-[calc(100vh-30px)] w-full flex-col overflow-hidden text-slate-100">
       <Header
+        user={authSession.user}
+        onSignOut={handleSignOut}
         isListening={isListening}
         captureMode={captureMode}
+        aiAllowed={canUseAi}
         isWindowCompact={isWindowCompact}
         onToggleWindowCompact={toggleWindowCompact}
         resume={resume}
@@ -556,7 +660,9 @@ function App() {
           className="absolute inset-0 overflow-y-auto px-4 pb-6 pt-3"
         >
           <div className="mx-auto flex max-w-3xl flex-col gap-4">
-            {showEmptyState && <EmptyState />}
+            {showEmptyState && <EmptyState aiAllowed={canUseAi} />}
+
+            {!canUseAi && <AiAccessBanner />}
 
             {chatMessages.map((msg, index) =>
               msg.role === "user" ? (
@@ -587,9 +693,13 @@ function App() {
               value={transcript}
               readOnly={false}
               isPartialActive={isListening}
-              placeholder="Whisper transcripts appear here after each pause. Type or paste, then Send to AI (Ctrl+Enter)."
+              placeholder={
+                canUseAi
+                  ? "Whisper transcripts appear here after each pause. Type or paste, then Send to AI (Ctrl+Enter)."
+                  : "Listening and typing work, but AI coaching requires access from an administrator."
+              }
               onChange={setTranscript}
-              onSubmit={() => void sendToAi()}
+              onSubmit={canUseAi ? () => void sendToAi() : undefined}
             />
           </div>
         </div>
@@ -605,7 +715,8 @@ function App() {
       <Composer
         isListening={isListening}
         isSending={isSending}
-        canSend={hasTranscript}
+        canSend={hasTranscript && canUseAi}
+        aiAllowed={canUseAi}
         onStart={startListening}
         onStop={stopListening}
         onSend={sendToAi}
@@ -615,7 +726,21 @@ function App() {
   );
 }
 
+function AiAccessBanner() {
+  return (
+    <div className="rounded-xl border border-amber-400/30 bg-amber-500/10 px-4 py-3 text-[13px] leading-relaxed text-amber-100">
+      AI coaching is turned off until an administrator allows you to use it for your
+      account. While this session is open. Each new sign-in clears AI
+      access; only one device can be signed in at a time. Signing out clears AI
+      again for next time.
+    </div>
+  );
+}
+
 function Header({
+  user,
+  onSignOut,
+  aiAllowed,
   isListening,
   captureMode,
   isWindowCompact,
@@ -635,6 +760,9 @@ function Header({
   updateProgress,
   onInstallUpdate,
 }: {
+  user: PublicUser;
+  onSignOut: () => void | Promise<void>;
+  aiAllowed: boolean;
   isListening: boolean;
   captureMode: string;
   isWindowCompact: boolean;
@@ -672,6 +800,26 @@ function Header({
       </div>
 
       <div className="flex shrink-0 items-center gap-2">
+          <span
+            className={
+              "hidden max-w-28 truncate rounded-full border px-2 py-1 text-[10px] font-medium sm:inline " +
+              (aiAllowed
+                ? "border-emerald-400/30 bg-emerald-500/10 text-emerald-200"
+                : "border-amber-400/30 bg-amber-500/10 text-amber-200")
+            }
+            title={user.email}
+          >
+            {aiAllowed ? "AI enabled" : "AI pending"}
+          </span>
+
+          <button
+            type="button"
+            onClick={onSignOut}
+            className="rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-[11px] font-medium text-slate-300 transition hover:bg-white/10"
+          >
+            Sign out
+          </button>
+
           {latestUpdateVersion && (
             <button
               type="button"
@@ -700,7 +848,7 @@ function Header({
             onClick={onToggleResumePanel}
             aria-expanded={resumePanelOpen}
             className={
-              "inline-flex max-w-[9rem] items-center gap-1.5 truncate rounded-full border px-2.5 py-1 text-[11px] font-medium transition hover:bg-white/10 active:scale-[0.98] sm:max-w-[11rem] " +
+              "inline-flex max-w-36 items-center gap-1.5 truncate rounded-full border px-2.5 py-1 text-[11px] font-medium transition hover:bg-white/10 active:scale-[0.98] sm:max-w-44" +
               (resume
                 ? "border-primary/40 bg-primary/10 text-primary"
                 : "border-white/10 bg-white/5 text-slate-300")
@@ -708,7 +856,7 @@ function Header({
           >
             <DocumentIcon className="size-3.5 shrink-0" />
             <span className="truncate">
-              {resume ? resume.fileName : "Resume (optional)"}
+              {resume ? resume.fileName : "Resume"}
             </span>
           </button>
 
@@ -833,7 +981,7 @@ function Header({
   );
 }
 
-function EmptyState() {
+function EmptyState({ aiAllowed }: { aiAllowed: boolean }) {
   return (
     <div className="mt-6 flex flex-col items-center gap-3 text-center">
       <div className="grid size-14 place-items-center rounded-2xl bg-linear-to-br from-primary/20 to-secondary/20 ring-1 ring-white/10">
@@ -853,9 +1001,13 @@ function EmptyState() {
           <span className="rounded bg-white/5 px-1.5 py-0.5 text-slate-200">
             Send to AI
           </span>{" "}
-          for a drafted answer. Optionally add your resume via{" "}
+          for a drafted answer
+          {!aiAllowed
+            ? " once an administrator enables AI access for your account"
+            : ""}
+          . Optionally add your resume via{" "}
           <span className="rounded bg-white/5 px-1.5 py-0.5 text-slate-200">
-            Resume (optional)
+            Resume
           </span>{" "}
           so experience questions use your real background. Shortcuts:{" "}
           <span className="rounded bg-white/5 px-1.5 py-0.5 text-slate-200">
@@ -1073,6 +1225,7 @@ function Composer({
   isListening,
   isSending,
   canSend,
+  aiAllowed,
   onStart,
   onStop,
   onSend,
@@ -1081,6 +1234,7 @@ function Composer({
   isListening: boolean;
   isSending: boolean;
   canSend: boolean;
+  aiAllowed: boolean;
   onStart: () => void;
   onStop: () => void;
   onSend: () => void;
@@ -1127,7 +1281,12 @@ function Composer({
         <button
           type="button"
           onClick={onSend}
-          disabled={isSending || !canSend}
+          disabled={isSending || !canSend || !aiAllowed}
+          title={
+            !aiAllowed
+              ? "Sign in with AI access enabled to send to AI"
+              : undefined
+          }
           className="group inline-flex cursor-pointer items-center gap-2 rounded-full bg-linear-to-br from-primary to-secondary px-4 py-2 text-[13px] font-semibold text-primary-foreground shadow-lg shadow-primary/25 transition hover:brightness-110 active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-50 disabled:shadow-none disabled:hover:brightness-100"
         >
           {isSending ? (
@@ -1138,7 +1297,7 @@ function Composer({
           ) : (
             <>
               <SendIcon className="size-4" />
-              Send to AI
+              {aiAllowed ? "Send to AI" : "AI locked"}
             </>
           )}
         </button>

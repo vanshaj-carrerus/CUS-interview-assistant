@@ -1,0 +1,36 @@
+/**
+ * @deprecated Import from `@/api` or `../api` instead.
+ * Re-exports the modular client under `src/api/`.
+ */
+export {
+  API_PATHS,
+  CUS_ASSISTANT_PREFIX,
+  HttpError,
+  apiAuthGetUser,
+  apiAuthLogin,
+  apiAuthLogout,
+  apiAuthMe,
+  apiAuthRegister,
+  apiFetch,
+  apiHealth,
+  apiInterviewPrompt,
+  apiLogin,
+  apiLogout,
+  apiRegister,
+  apiGetMe,
+  apiUrl,
+  apiUsersByEmail,
+  apiUsersGetById,
+  apiUsersSetAiAllowed,
+  getApiBaseUrl,
+  parseApiError,
+  recordToPublicUser,
+  type AssistantUserRecord,
+  type AuthSession,
+  type GetUserBody,
+  type LoginBody,
+  type PublicUser,
+  type RegisterBody,
+  type SetAiAllowedBody,
+  type UsersByEmailBody,
+} from "../api";

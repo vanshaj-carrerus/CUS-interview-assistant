@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { usesRemoteApi } from "../api/http";
 
 export const API_KEY_NAMES = [
   "VITE_GEMINI_API_KEY",
@@ -21,17 +22,24 @@ function fromVite(key: ApiKeyName): string | undefined {
   return typeof v === "string" && v.trim() ? v.trim() : undefined;
 }
 
-/** API key from Vite build env or Rust runtime (compile-time / app config `.env`). */
+/** @deprecated Client-side AI keys are not used in production. Interview AI runs on the server. */
 export function apiKey(key: ApiKeyName): string | undefined {
+  if (usesRemoteApi()) return undefined;
   return fromVite(key) ?? runtimeKeys?.[key];
 }
 
+/** @deprecated */
 export function hasAnyApiKey(): boolean {
+  if (usesRemoteApi()) return false;
   return API_KEY_NAMES.some((name) => !!apiKey(name));
 }
 
-/** Load keys from the Tauri backend when the Vite bundle has none (e.g. CI release without embed). */
+/**
+ * Legacy path for local-only experiments. Production builds use the remote API;
+ * AI keys must not be loaded into the desktop app.
+ */
 export async function ensureApiKeysLoaded(): Promise<void> {
+  if (usesRemoteApi()) return;
   if (API_KEY_NAMES.some((name) => fromVite(name))) return;
   if (!isTauriRuntime()) return;
   if (!loadPromise) {

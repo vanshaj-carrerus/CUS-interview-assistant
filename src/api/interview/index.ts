@@ -1,0 +1,1 @@
+export { apiInterviewPrompt } from "./prompt";

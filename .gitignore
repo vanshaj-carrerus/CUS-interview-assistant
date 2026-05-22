@@ -17,9 +17,13 @@ dist-ssr
 .env.*
 !.env.example
 src-tauri/.env
+src-tauri/backend.env
 
 *.key
 src-tauri/.tauri/
+
+# Never commit a folder named "~" used as a mistaken home path (use %USERPROFILE%\.tauri)
+/~/
 
 # Editor directories and files
 .vscode/*

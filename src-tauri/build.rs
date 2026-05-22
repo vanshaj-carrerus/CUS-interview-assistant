@@ -19,15 +19,17 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
 }
 
 fn main() {
-    tauri_build::build();
+    println!("cargo::rustc-check-cfg=cfg(remote_api_only)");
+    println!("cargo:rustc-cfg=remote_api_only");
 
     let manifest_dir =
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR missing"));
-    let models_src = manifest_dir.join("models").join("whisper");
 
+    tauri_build::build();
+
+    let models_src = manifest_dir.join("models").join("whisper");
     println!("cargo:rerun-if-changed={}", models_src.display());
 
-    // Copy Whisper GGML models next to produced binaries for `cargo run` / `tauri dev`.
     let profile_dir = manifest_dir.join("target").join(
         env::var("PROFILE").unwrap_or_else(|_| "debug".to_string()),
     );

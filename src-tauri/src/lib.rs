@@ -73,64 +73,9 @@ fn emit_stt_error(app: &AppHandle, message: String) {
     eprintln!("[stt] {message}");
 }
 
-fn parse_dotenv_line(line: &str, keys: &mut HashMap<String, String>) {
-    let line = line.trim();
-    if line.is_empty() || line.starts_with('#') {
-        return;
-    }
-    let Some((name, value)) = line.split_once('=') else {
-        return;
-    };
-    let name = name.trim();
-    if !name.starts_with("VITE_") {
-        return;
-    }
-    let value = value
-        .trim()
-        .trim_matches('"')
-        .trim_matches('\'')
-        .trim();
-    if !value.is_empty() {
-        keys.entry(name.to_string())
-            .or_insert_with(|| value.to_string());
-    }
-}
-
-fn compile_time_api_keys() -> HashMap<String, String> {
-    let mut keys = HashMap::new();
-    for (name, value) in [
-        ("VITE_GEMINI_API_KEY", option_env!("VITE_GEMINI_API_KEY")),
-        ("VITE_GROQ_API_KEY", option_env!("VITE_GROQ_API_KEY")),
-        ("VITE_MISTRAL_API_KEY", option_env!("VITE_MISTRAL_API_KEY")),
-        (
-            "VITE_OPENROUTER_API_KEY",
-            option_env!("VITE_OPENROUTER_API_KEY"),
-        ),
-    ] {
-        if let Some(v) = value {
-            let trimmed = v.trim();
-            if !trimmed.is_empty() {
-                keys.insert(name.to_string(), trimmed.to_string());
-            }
-        }
-    }
-    keys
-}
-
 #[tauri::command]
-fn get_api_keys(app: AppHandle) -> HashMap<String, String> {
-    let mut keys = compile_time_api_keys();
-
-    if let Ok(config_dir) = app.path().app_config_dir() {
-        let env_path = config_dir.join(".env");
-        if let Ok(content) = std::fs::read_to_string(&env_path) {
-            for line in content.lines() {
-                parse_dotenv_line(line, &mut keys);
-            }
-        }
-    }
-
-    keys
+fn get_api_keys() -> HashMap<String, String> {
+    HashMap::new()
 }
 
 fn normalize_path(path: PathBuf) -> String {
@@ -643,6 +588,8 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
+            eprintln!("[api] Using remote CUS Tech API (VITE_API_URL / https://www.custech.co).");
+
             let window = app
                 .get_webview_window("main")
                 .ok_or("main window not found")?;
