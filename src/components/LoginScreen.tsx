@@ -33,8 +33,8 @@ export function LoginScreen({
   };
 
   return (
-    <div className="flex h-full min-h-[calc(100vh-30px)] w-full items-center justify-center bg-surface/80 px-4 py-8">
-      <div className="w-full max-w-md rounded-2xl border border-white/10 bg-surface-2/90 p-6 shadow-2xl shadow-black/40 backdrop-blur-xl">
+    <div className="flex h-full min-h-[calc(100vh-30px)] w-full items-center justify-center px-4 py-8">
+      <div className="w-full max-w-md rounded-2xl border border-white/10 bg-surface-2/55 p-6 shadow-2xl shadow-black/25 backdrop-blur-xl">
         <div className="mb-6 text-center">
           <div className="mx-auto mb-3 grid size-12 place-items-center rounded-xl bg-linear-to-br from-primary to-secondary shadow-lg shadow-primary/25">
             <SparkleIcon className="size-6 text-white" />
@@ -157,7 +157,7 @@ function Field({ label, children }: { label: string; children: ReactNode }) {
 }
 
 const inputClass =
-  "block w-full rounded-xl border border-white/10 bg-surface/80 px-3 py-2.5 text-[14px] text-slate-100 placeholder:text-slate-500 focus:outline-none focus:ring-1 focus:ring-primary/40";
+  "block w-full rounded-xl border border-white/10 bg-surface/45 px-3 py-2.5 text-[14px] text-slate-100 placeholder:text-slate-500 backdrop-blur-md focus:outline-none focus:ring-1 focus:ring-primary/40";
 
 function SparkleIcon({ className }: { className?: string }) {
   return (

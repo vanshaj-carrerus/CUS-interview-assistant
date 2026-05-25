@@ -783,7 +783,7 @@ function Header({
   onInstallUpdate: () => void;
 }) {
   return (
-    <header className="relative shrink-0 border-b border-white/5 bg-surface/40 backdrop-blur-md">
+    <header className="relative shrink-0 border-b border-white/5 bg-surface/25 backdrop-blur-lg">
       <div className="flex items-center justify-between gap-3 px-4 py-3">
       <div className="flex min-w-0 items-center gap-3">
         <div className="relative grid size-9 shrink-0 place-items-center rounded-xl bg-linear-to-br from-primary to-secondary shadow-lg shadow-primary/25">
@@ -963,7 +963,7 @@ function Header({
             placeholder="Or paste resume text here…"
             rows={4}
             spellCheck={false}
-            className="mt-3 block w-full resize-y rounded-xl border border-white/10 bg-surface-2/80 px-3 py-2 text-[13px] leading-relaxed text-slate-100 placeholder:text-slate-500 focus:outline-none focus:ring-1 focus:ring-primary/40"
+            className="mt-3 block w-full resize-y rounded-xl border border-white/10 bg-surface-2/50 px-3 py-2 text-[13px] leading-relaxed text-slate-100 placeholder:text-slate-500 backdrop-blur-md focus:outline-none focus:ring-1 focus:ring-primary/40"
           />
           <div className="mt-2 flex justify-end">
             <button
@@ -1069,7 +1069,7 @@ function UserBubble({
         </div>
         <div className="group rounded-2xl rounded-tr-sm bg-linear-to-br from-primary/25 to-primary/10 p-px shadow-lg shadow-primary/10 ring-1 ring-primary/30">
           {readOnly ? (
-            <p className="max-h-60 overflow-y-auto whitespace-pre-wrap rounded-2xl rounded-tr-sm bg-surface-2/80 px-4 py-3 text-[14px] leading-relaxed text-slate-100">
+            <p className="max-h-60 overflow-y-auto whitespace-pre-wrap rounded-2xl rounded-tr-sm bg-surface-2/50 px-4 py-3 text-[14px] leading-relaxed text-slate-100 backdrop-blur-md">
               {value}
             </p>
           ) : (
@@ -1087,7 +1087,7 @@ function UserBubble({
               placeholder={placeholder}
               spellCheck={false}
               rows={3}
-              className="block min-h-22 w-full resize-y rounded-2xl rounded-tr-sm bg-surface-2/80 px-4 py-3 text-[14px] leading-relaxed text-slate-100 placeholder:text-slate-500 focus:outline-none"
+              className="block min-h-22 w-full resize-y rounded-2xl rounded-tr-sm bg-surface-2/50 px-4 py-3 text-[14px] leading-relaxed text-slate-100 placeholder:text-slate-500 backdrop-blur-md focus:outline-none"
             />
           )}
         </div>
@@ -1106,7 +1106,7 @@ function TypingBubble() {
           </div>
           <span>Assistant</span>
         </div>
-        <div className="rounded-2xl rounded-tl-sm border border-white/5 bg-surface-2/70 px-4 py-3 backdrop-blur">
+        <div className="rounded-2xl rounded-tl-sm border border-white/5 bg-surface-2/45 px-4 py-3 backdrop-blur-md">
           <div className="flex items-center gap-1.5">
             <span className="typing-dot" />
             <span className="typing-dot" />
@@ -1147,7 +1147,7 @@ function AiBubble({
           </div>
           <span>Assistant</span>
         </div>
-        <div className="w-full min-w-0 rounded-2xl rounded-tl-sm border border-white/5 bg-surface-2/70 px-4 py-3 text-[14px] leading-relaxed text-slate-100 shadow-lg shadow-black/20 backdrop-blur">
+        <div className="w-full min-w-0 rounded-2xl rounded-tl-sm border border-white/5 bg-surface-2/45 px-4 py-3 text-[14px] leading-relaxed text-slate-100 shadow-lg shadow-black/15 backdrop-blur-md">
           <p
             className="whitespace-pre-wrap wrap-break-word text-slate-100"
             aria-live="polite"
@@ -1241,7 +1241,7 @@ function Composer({
   onClear: () => void;
 }) {
   return (
-    <div className="shrink-0 border-t border-white/5 bg-surface/60 px-3 py-3 backdrop-blur-xl">
+    <div className="shrink-0 border-t border-white/5 bg-surface/30 px-3 py-3 backdrop-blur-xl">
       <div className="mx-auto flex max-w-3xl items-center gap-2">
         <button
           type="button"

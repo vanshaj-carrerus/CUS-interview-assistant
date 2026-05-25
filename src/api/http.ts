@@ -47,6 +47,9 @@ export async function parseApiError(res: Response): Promise<string> {
   if (res.status === 403) {
     return "Your account does not have AI interview access yet. Contact an administrator.";
   }
+  if (res.status === 409) {
+    return "Another user is already signed in. They must sign out before you can sign in.";
+  }
   return `Request failed (${res.status}).`;
 }
 

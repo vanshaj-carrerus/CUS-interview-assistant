@@ -65,9 +65,9 @@ Users sign in inside the app. They only receive a **session token** — not data
 
 ### Turning on AI for a session
 
-1. User signs in (`aiAllowed` starts false).
+1. User signs in (`aiAllowed` is reset to `false` on every sign-in).
 2. You set `aiAllowed: true` in MongoDB or via admin API while they use the app (polls every ~22s and on window focus).
-3. Sign-out clears `sessionId` and sets `aiAllowed: false`.
+3. Sign-out clears `sessionId` so another user can sign in. Only one user may be signed in at a time.
 
 ## Development
 
