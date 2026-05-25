@@ -4,7 +4,7 @@
   Build a production desktop installer that talks to your hosted API only (no embedded secrets).
 
 .DESCRIPTION
-  Requires VITE_API_URL in src-tauri/.env (HTTPS in production).
+  Uses https://www.custech.co by default. Optional src-tauri/.env overrides VITE_API_URL.
   Strips client-side AI keys from the build environment.
   Sets CUS_REMOTE_API=1 so the embedded MongoDB/API is not compiled in.
 
@@ -18,25 +18,15 @@ $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $envFile = Join-Path $repoRoot "src-tauri\.env"
+$defaultApiUrl = "https://www.custech.co"
+$apiUrl = $defaultApiUrl
 
-if (-not (Test-Path -LiteralPath $envFile)) {
-  Write-Host ""
-  Write-Host "Missing src-tauri/.env" -ForegroundColor Red
-  Write-Host "Copy src-tauri/.env.example and set VITE_API_URL to your deployed API (HTTPS)." -ForegroundColor Yellow
-  Write-Host ""
-  exit 1
+if (Test-Path -LiteralPath $envFile) {
+  $envContent = Get-Content -LiteralPath $envFile -Raw
+  if ($envContent -match '(?m)^\s*VITE_API_URL\s*=\s*(\S+)') {
+    $apiUrl = $Matches[1].Trim().Trim('"').Trim("'")
+  }
 }
-
-$envContent = Get-Content -LiteralPath $envFile -Raw
-if ($envContent -notmatch '(?m)^\s*VITE_API_URL\s*=\s*(\S+)') {
-  Write-Host ""
-  Write-Host "Production builds require VITE_API_URL in src-tauri/.env" -ForegroundColor Red
-  Write-Host "Example: VITE_API_URL=https://api.yourcompany.com" -ForegroundColor Yellow
-  Write-Host ""
-  exit 1
-}
-
-$apiUrl = $Matches[1].Trim().Trim('"').Trim("'")
 if ($apiUrl -match '^http://(127\.0\.0\.1|localhost)') {
   Write-Host ""
   Write-Host "Warning: VITE_API_URL points at localhost ($apiUrl)." -ForegroundColor Yellow

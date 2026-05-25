@@ -1,11 +1,17 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
+import { DEFAULT_API_URL } from "./src/api/defaults";
 
 const host = process.env.TAURI_DEV_HOST;
 const isTauri = !!process.env.TAURI_ENV_PLATFORM;
 const isTauriRelease = isTauri && process.env.TAURI_ENV_DEBUG !== "true";
-const apiUrl = process.env.VITE_API_URL?.trim() ?? "";
+let apiUrl = process.env.VITE_API_URL?.trim() ?? "";
+
+if (isTauriRelease && !apiUrl) {
+  apiUrl = DEFAULT_API_URL;
+  process.env.VITE_API_URL = DEFAULT_API_URL;
+}
 
 const CLIENT_SECRET_KEYS = [
   "VITE_GEMINI_API_KEY",
@@ -15,12 +21,6 @@ const CLIENT_SECRET_KEYS = [
 ] as const;
 
 if (isTauriRelease) {
-  if (!apiUrl) {
-    throw new Error(
-      "Release builds require VITE_API_URL in src-tauri/.env (your hosted API). " +
-        "Run: npm run tauri:build:production. See SECURITY.md.",
-    );
-  }
   for (const key of CLIENT_SECRET_KEYS) {
     if (process.env[key]?.trim()) {
       throw new Error(

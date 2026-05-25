@@ -1,4 +1,7 @@
+import { DEFAULT_API_URL } from "./defaults";
 import { API_PATHS } from "./paths";
+
+export { DEFAULT_API_URL };
 
 export class HttpError extends Error {
   constructor(
@@ -9,9 +12,6 @@ export class HttpError extends Error {
     this.name = "HttpError";
   }
 }
-
-/** CUS Tech production API (override with VITE_API_URL in src-tauri/.env). */
-export const DEFAULT_API_URL = "https://www.custech.co";
 
 /** Production / hosted API: secrets stay on CUS Tech; client only holds the user's JWT. */
 export function usesRemoteApi(): boolean {

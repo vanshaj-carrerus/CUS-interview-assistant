@@ -39,7 +39,7 @@ Users authenticate with **email + password** and receive a **session JWT**. They
    npm run tauri:build:signed
    ```
 
-Release builds **fail** if `VITE_API_URL` is missing or if client-side `VITE_*_API_KEY` variables are set.
+Release builds default to `https://www.custech.co` when `VITE_API_URL` is unset. They **fail** if client-side `VITE_*_API_KEY` variables are set.
 
 ### Controlling who can use the app
 
