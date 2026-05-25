@@ -3,6 +3,7 @@ use cpal::{SampleFormat, StreamConfig};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -23,9 +24,15 @@ use windows::Win32::{
 
 const WHISPER_SAMPLE_RATE: u32 = 16_000;
 const FRAME_MS: u32 = 40;
-const SILENCE_END_SECS: f64 = 1.5;
+/// End-of-phrase silence — long enough for natural interview pauses without splitting one question.
+const SILENCE_END_SECS: f64 = 2.8;
+/// Emit live partial transcripts while speech is still active.
+const PARTIAL_INTERVAL_SECS: f64 = 0.7;
 const RMS_SILENCE_THRESHOLD: f32 = 0.008;
 const MIN_UTTERANCE_SECS: f64 = 0.35;
+/// Force a final chunk if someone speaks continuously without a long pause.
+const MAX_UTTERANCE_SECS: f64 = 45.0;
+const INFERENCE_RETRIES: u32 = 2;
 const BUNDLED_WHISPER_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/whisper");
 const PREFERRED_MODELS: &[&str] = &["ggml-base.en.bin", "ggml-tiny.en.bin"];
 /// Real GGML Whisper models are tens of MB; LFS pointer stubs are ~130 bytes.
@@ -36,13 +43,27 @@ struct SttErrorPayload {
     message: String,
 }
 
+#[derive(Clone, Serialize)]
+struct SttListeningPayload {
+    active: bool,
+}
+
 enum ControlMessage {
     Stop,
 }
 
 enum InferenceMessage {
-    Transcribe(Vec<f32>),
+    Partial(Vec<f32>, u64),
+    Final(Vec<f32>),
     Stop,
+}
+
+enum VadEvent {
+    None,
+    SpeechStarted,
+    SpeechEnded,
+    Partial(Vec<f32>, u64),
+    Final(Vec<f32>),
 }
 
 pub struct AppState {
@@ -61,6 +82,17 @@ impl Default for AppState {
 
 fn emit_stt_result(app: &AppHandle, text: String) {
     let _ = app.emit("stt-result", text);
+}
+
+fn emit_stt_partial(app: &AppHandle, text: String) {
+    let _ = app.emit("stt-partial", text);
+}
+
+fn emit_stt_listening(app: &AppHandle, active: bool) {
+    let _ = app.emit(
+        "stt-listening",
+        SttListeningPayload { active },
+    );
 }
 
 fn emit_stt_error(app: &AppHandle, message: String) {
@@ -202,33 +234,14 @@ fn load_whisper_context(model_path: &str) -> Result<WhisperContext, String> {
         .map_err(|err| format!("Failed to load Whisper model at {model_path}: {err}"))
 }
 
-fn transcribe_samples(ctx: &WhisperContext, samples: &[f32]) -> Result<String, String> {
-    if samples.len() < (WHISPER_SAMPLE_RATE as f64 * MIN_UTTERANCE_SECS) as usize {
-        return Ok(String::new());
-    }
-
-    let mut state = ctx
-        .create_state()
-        .map_err(|err| format!("Failed to create Whisper state: {err}"))?;
-
-    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-    params.set_language(Some("en"));
-    params.set_translate(false);
-    params.set_print_special(false);
-    params.set_print_progress(false);
-    params.set_print_realtime(false);
-    params.set_print_timestamps(false);
-
-    let threads = thread::available_parallelism()
+fn whisper_thread_count() -> i32 {
+    thread::available_parallelism()
         .map(|n| n.get() as i32)
         .unwrap_or(4)
-        .clamp(1, 8);
-    params.set_n_threads(threads);
+        .clamp(1, 8)
+}
 
-    state
-        .full(params, samples)
-        .map_err(|err| format!("Whisper inference failed: {err}"))?;
-
+fn collect_whisper_text(state: &whisper_rs::WhisperState) -> Result<String, String> {
     let num_segments = state.full_n_segments();
     let mut text = String::new();
     for i in 0..num_segments {
@@ -245,8 +258,63 @@ fn transcribe_samples(ctx: &WhisperContext, samples: &[f32]) -> Result<String, S
             text.push_str(segment.trim());
         }
     }
-
     Ok(text.trim().to_string())
+}
+
+fn run_whisper(
+    ctx: &WhisperContext,
+    samples: &[f32],
+    partial: bool,
+) -> Result<String, String> {
+    if samples.len() < (WHISPER_SAMPLE_RATE as f64 * MIN_UTTERANCE_SECS) as usize {
+        return Ok(String::new());
+    }
+
+    let mut state = ctx
+        .create_state()
+        .map_err(|err| format!("Failed to create Whisper state: {err}"))?;
+
+    let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
+    params.set_language(Some("en"));
+    params.set_translate(false);
+    params.set_print_special(false);
+    params.set_print_progress(false);
+    params.set_print_realtime(false);
+    params.set_print_timestamps(false);
+    params.set_n_threads(whisper_thread_count());
+
+    if partial {
+        params.set_no_context(true);
+        params.set_single_segment(true);
+        params.set_suppress_blank(true);
+        params.set_suppress_nst(true);
+    }
+
+    state
+        .full(params, samples)
+        .map_err(|err| format!("Whisper inference failed: {err}"))?;
+
+    collect_whisper_text(&state)
+}
+
+fn transcribe_with_retry(
+    ctx: &WhisperContext,
+    samples: &[f32],
+    partial: bool,
+) -> Result<String, String> {
+    let mut last_err = String::new();
+    for attempt in 0..INFERENCE_RETRIES {
+        match run_whisper(ctx, samples, partial) {
+            Ok(text) => return Ok(text),
+            Err(err) => {
+                last_err = err;
+                if attempt + 1 < INFERENCE_RETRIES {
+                    thread::sleep(Duration::from_millis(80));
+                }
+            }
+        }
+    }
+    Err(last_err)
 }
 
 fn frame_rms(samples: &[f32]) -> f32 {
@@ -291,8 +359,12 @@ fn mono_from_interleaved<T: Copy>(data: &[T], channels: usize, to_f32: impl Fn(T
 struct VadBuffer {
     utterance: Vec<f32>,
     silence_ms: f64,
+    speech_ms: f64,
     had_speech: bool,
+    was_speaking: bool,
     frame_ms: f64,
+    partial_seq: u64,
+    samples_since_partial: usize,
 }
 
 impl VadBuffer {
@@ -300,41 +372,127 @@ impl VadBuffer {
         Self {
             utterance: Vec::new(),
             silence_ms: 0.0,
+            speech_ms: 0.0,
             had_speech: false,
+            was_speaking: false,
             frame_ms,
+            partial_seq: 0,
+            samples_since_partial: 0,
         }
     }
 
-    fn push_frame(&mut self, frame: &[f32]) -> Option<Vec<f32>> {
+    fn partial_interval_samples() -> usize {
+        (WHISPER_SAMPLE_RATE as f64 * PARTIAL_INTERVAL_SECS) as usize
+    }
+
+    fn max_utterance_samples() -> usize {
+        (WHISPER_SAMPLE_RATE as f64 * MAX_UTTERANCE_SECS) as usize
+    }
+
+    fn reset_utterance(&mut self) {
+        self.utterance.clear();
+        self.had_speech = false;
+        self.was_speaking = false;
+        self.silence_ms = 0.0;
+        self.speech_ms = 0.0;
+        self.samples_since_partial = 0;
+    }
+
+    fn take_final_chunk(&mut self) -> Option<Vec<f32>> {
+        let min_samples = (WHISPER_SAMPLE_RATE as f64 * MIN_UTTERANCE_SECS) as usize;
+        if self.utterance.len() >= min_samples {
+            let chunk = std::mem::take(&mut self.utterance);
+            self.reset_utterance();
+            return Some(chunk);
+        }
+        self.reset_utterance();
+        None
+    }
+
+    fn maybe_partial(&mut self) -> Option<(Vec<f32>, u64)> {
+        if self.samples_since_partial < Self::partial_interval_samples() {
+            return None;
+        }
+        let min_samples = (WHISPER_SAMPLE_RATE as f64 * MIN_UTTERANCE_SECS) as usize;
+        if self.utterance.len() < min_samples {
+            return None;
+        }
+        self.samples_since_partial = 0;
+        self.partial_seq = self.partial_seq.wrapping_add(1);
+        Some((self.utterance.clone(), self.partial_seq))
+    }
+
+    fn push_frame(&mut self, frame: &[f32]) -> VadEvent {
         let energy = frame_rms(frame);
         let is_speech = energy >= RMS_SILENCE_THRESHOLD;
 
         if is_speech {
+            let just_started = !self.was_speaking;
             self.had_speech = true;
+            self.was_speaking = true;
             self.silence_ms = 0.0;
+            self.speech_ms += self.frame_ms;
             self.utterance.extend_from_slice(frame);
-            return None;
+            self.samples_since_partial += frame.len();
+
+            if self.utterance.len() >= Self::max_utterance_samples() {
+                if let Some(chunk) = self.take_final_chunk() {
+                    return VadEvent::Final(chunk);
+                }
+            }
+
+            if just_started {
+                return VadEvent::SpeechStarted;
+            }
+
+            if let Some((chunk, id)) = self.maybe_partial() {
+                return VadEvent::Partial(chunk, id);
+            }
+
+            return VadEvent::None;
         }
 
         if self.had_speech {
             self.utterance.extend_from_slice(frame);
             self.silence_ms += self.frame_ms;
             if self.silence_ms >= SILENCE_END_SECS * 1000.0 {
-                let min_samples = (WHISPER_SAMPLE_RATE as f64 * MIN_UTTERANCE_SECS) as usize;
-                if self.utterance.len() >= min_samples {
-                    let chunk = std::mem::take(&mut self.utterance);
-                    self.had_speech = false;
-                    self.silence_ms = 0.0;
-                    return Some(chunk);
+                if let Some(chunk) = self.take_final_chunk() {
+                    return VadEvent::Final(chunk);
                 }
-                self.utterance.clear();
-                self.had_speech = false;
-                self.silence_ms = 0.0;
+                self.was_speaking = false;
+                return VadEvent::SpeechEnded;
             }
+            return VadEvent::None;
         }
 
-        None
+        VadEvent::None
     }
+}
+
+fn drain_inference_batch(rx: &Receiver<InferenceMessage>) -> Vec<InferenceMessage> {
+    let first = match rx.recv() {
+        Ok(msg) => msg,
+        Err(_) => return Vec::new(),
+    };
+    let mut batch = vec![first];
+    while let Ok(msg) = rx.try_recv() {
+        batch.push(msg);
+    }
+    batch
+}
+
+fn collapse_partial_jobs(batch: Vec<InferenceMessage>) -> (Vec<InferenceMessage>, Option<(Vec<f32>, u64)>) {
+    let mut ordered = Vec::new();
+    let mut latest_partial: Option<(Vec<f32>, u64)> = None;
+
+    for msg in batch {
+        match msg {
+            InferenceMessage::Partial(samples, id) => latest_partial = Some((samples, id)),
+            other => ordered.push(other),
+        }
+    }
+
+    (ordered, latest_partial)
 }
 
 fn run_inference_worker(
@@ -342,14 +500,50 @@ fn run_inference_worker(
     app: AppHandle,
     inference_rx: Receiver<InferenceMessage>,
 ) {
-    while let Ok(message) = inference_rx.recv() {
-        match message {
-            InferenceMessage::Stop => break,
-            InferenceMessage::Transcribe(samples) => {
-                match transcribe_samples(ctx.as_ref(), &samples) {
-                    Ok(text) if !text.is_empty() => emit_stt_result(&app, text),
-                    Ok(_) => {}
-                    Err(err) => emit_stt_error(&app, err),
+    let latest_partial_id = Arc::new(AtomicU64::new(0));
+
+    loop {
+        let batch = drain_inference_batch(&inference_rx);
+        if batch.is_empty() {
+            break;
+        }
+
+        let (mut jobs, latest_partial) = collapse_partial_jobs(batch);
+        if let Some((samples, id)) = latest_partial {
+            jobs.push(InferenceMessage::Partial(samples, id));
+        }
+
+        for job in jobs {
+            match job {
+                InferenceMessage::Stop => return,
+                InferenceMessage::Final(samples) => {
+                    latest_partial_id.store(0, Ordering::Release);
+                    match transcribe_with_retry(ctx.as_ref(), &samples, false) {
+                        Ok(text) if !text.is_empty() => {
+                            emit_stt_listening(&app, false);
+                            emit_stt_partial(&app, String::new());
+                            emit_stt_result(&app, text);
+                        }
+                        Ok(_) => emit_stt_listening(&app, false),
+                        Err(err) => emit_stt_error(&app, err),
+                    }
+                }
+                InferenceMessage::Partial(samples, id) => {
+                    latest_partial_id.store(id, Ordering::Release);
+                    match transcribe_with_retry(ctx.as_ref(), &samples, true) {
+                        Ok(text) if !text.is_empty() => {
+                            if latest_partial_id.load(Ordering::Acquire) == id {
+                                emit_stt_listening(&app, true);
+                                emit_stt_partial(&app, text);
+                            }
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            if latest_partial_id.load(Ordering::Acquire) == id {
+                                emit_stt_error(&app, err);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -357,6 +551,7 @@ fn run_inference_worker(
 }
 
 fn build_loopback_stream(
+    app: AppHandle,
     device: &cpal::Device,
     config: &StreamConfig,
     sample_format: SampleFormat,
@@ -373,13 +568,26 @@ fn build_loopback_stream(
     let push_pending = move |pending: &mut Vec<f32>, vad: &mut VadBuffer| {
         while pending.len() >= frame_samples {
             let frame: Vec<f32> = pending.drain(..frame_samples).collect();
-            if let Some(chunk) = vad.push_frame(&frame) {
-                if inference_tx
-                    .send(InferenceMessage::Transcribe(chunk))
-                    .is_err()
-                {
-                    break;
+            match vad.push_frame(&frame) {
+                VadEvent::SpeechStarted => emit_stt_listening(&app, true),
+                VadEvent::SpeechEnded => emit_stt_listening(&app, false),
+                VadEvent::Partial(chunk, id) => {
+                    if inference_tx
+                        .send(InferenceMessage::Partial(chunk, id))
+                        .is_err()
+                    {
+                        break;
+                    }
                 }
+                VadEvent::Final(chunk) => {
+                    if inference_tx
+                        .send(InferenceMessage::Final(chunk))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                VadEvent::None => {}
             }
         }
     };
@@ -480,6 +688,7 @@ fn start_listening_thread(
         let sample_format = output_config.sample_format();
 
         let stream = match build_loopback_stream(
+            app.clone(),
             &device,
             &stream_config,
             sample_format,

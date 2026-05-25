@@ -67,7 +67,7 @@ Users sign in inside the app. They only receive a **session token** — not data
 
 1. User signs in (`aiAllowed` is reset to `false` on every sign-in).
 2. You set `aiAllowed: true` in MongoDB or via admin API while they use the app (polls every ~22s and on window focus).
-3. Sign-out clears `sessionId` so another user can sign in. Only one user may be signed in at a time.
+3. Sign-out clears `sessionId` so the same email can sign in elsewhere. One active session per email (no two devices at once).
 
 ## Development
 
@@ -95,7 +95,7 @@ npm run tauri dev
 # Do not set VITE_API_URL
 ```
 
-On launch the app loads Whisper and starts system-audio listening. Final phrases are emitted as Tauri events (`stt-result`) after ~1.5s of silence.
+On launch the app loads Whisper and starts system-audio listening. Live partial text is streamed (`stt-partial` while speech is active); finalized phrases append on `stt-result` after ~2.8s of silence (tolerant of natural interview pauses). Send to AI only when you press **Send to AI** or Ctrl+Enter — nothing is auto-sent.
 
 ### Windows build notes
 

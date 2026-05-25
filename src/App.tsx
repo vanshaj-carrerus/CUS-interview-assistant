@@ -90,9 +90,6 @@ const DEFAULT_WHISPER_MODEL_PATH = "";
 const WINDOW_MIN_INNER = { width: 340, height: 260 };
 const WINDOW_DEFAULT_INNER = { width: 600, height: 600 };
 
-/** While listening, auto-send accumulated transcript after this much quiet time (ms). */
-const AUTO_SEND_SILENCE_MS = 5000;
-
 type SendToAiOptions = {
   snapshot?: string;
   /** Skip empty-state error toast (auto-send paths). */
@@ -114,7 +111,9 @@ function App() {
   const [isListening, setIsListening] = useState(false);
   const [isSending, setIsSending] = useState(false);
   const [captureMode, setCaptureMode] = useState("Idle");
-  const [transcript, setTranscript] = useState("");
+  const [committedTranscript, setCommittedTranscript] = useState("");
+  const [livePartial, setLivePartial] = useState("");
+  const [isHearingSpeech, setIsHearingSpeech] = useState(false);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [errorMessage, setErrorMessage] = useState("");
   const [isWindowCompact, setIsWindowCompact] = useState(false);
@@ -130,15 +129,27 @@ function App() {
   const [updateProgress, setUpdateProgress] = useState<number | null>(null);
   const resumeFileInputRef = useRef<HTMLInputElement>(null);
   const savedInnerLogicalSizeRef = useRef<{ width: number; height: number } | null>(null);
-  const transcriptRef = useRef(transcript);
+  const committedTranscriptRef = useRef(committedTranscript);
+  const livePartialRef = useRef(livePartial);
   const isListeningRef = useRef(isListening);
   const isSendingRef = useRef(isSending);
   const sendToAiRef = useRef<(options?: SendToAiOptions) => Promise<void>>(async () => {});
   const scrollRef = useRef<HTMLDivElement>(null);
 
+  const transcript = useMemo(() => {
+    const committed = committedTranscript.trim();
+    const partial = livePartial.trim();
+    if (!partial) return committed;
+    return committed ? `${committed} ${partial}` : partial;
+  }, [committedTranscript, livePartial]);
+
   useEffect(() => {
-    transcriptRef.current = transcript;
-  }, [transcript]);
+    committedTranscriptRef.current = committedTranscript;
+  }, [committedTranscript]);
+
+  useEffect(() => {
+    livePartialRef.current = livePartial;
+  }, [livePartial]);
 
   useEffect(() => {
     isListeningRef.current = isListening;
@@ -252,6 +263,8 @@ function App() {
     if (!isTauriRuntime()) return;
 
     let sttUnlisten: UnlistenFn | null = null;
+    let partialUnlisten: UnlistenFn | null = null;
+    let listeningUnlisten: UnlistenFn | null = null;
     let errorUnlisten: UnlistenFn | null = null;
 
     const setup = async () => {
@@ -275,8 +288,23 @@ function App() {
 
       sttUnlisten = await listen<string>("stt-result", (event) => {
         const text = event.payload?.trim();
+        setLivePartial("");
+        setIsHearingSpeech(false);
         if (!text) return;
-        setTranscript((prev) => (prev ? `${prev} ${text}` : text).trim());
+        setCommittedTranscript((prev) => (prev ? `${prev} ${text}` : text).trim());
+      });
+
+      partialUnlisten = await listen<string>("stt-partial", (event) => {
+        const text = event.payload?.trim();
+        if (!text) {
+          setLivePartial("");
+          return;
+        }
+        setLivePartial(text);
+      });
+
+      listeningUnlisten = await listen<{ active: boolean }>("stt-listening", (event) => {
+        setIsHearingSpeech(!!event.payload?.active);
       });
 
       errorUnlisten = await listen<SttErrorPayload>("stt-error", (event) => {
@@ -290,6 +318,8 @@ function App() {
 
     return () => {
       if (sttUnlisten) void sttUnlisten();
+      if (partialUnlisten) void partialUnlisten();
+      if (listeningUnlisten) void listeningUnlisten();
       if (errorUnlisten) void errorUnlisten();
       void invoke("stop_interview_listening");
     };
@@ -323,17 +353,17 @@ function App() {
 
   const stopListening = useCallback(async () => {
     if (!isTauriRuntime()) return;
-    const snapshot = transcriptRef.current.trim();
-    if (snapshot && !isSendingRef.current) {
-      await sendToAiRef.current({ snapshot, silent: true });
-    }
     await invoke("stop_interview_listening");
     setIsListening(false);
+    setIsHearingSpeech(false);
+    setLivePartial("");
     setCaptureMode("Stopped");
   }, []);
 
   const clearAll = useCallback(() => {
-    setTranscript("");
+    setCommittedTranscript("");
+    setLivePartial("");
+    setIsHearingSpeech(false);
     setChatMessages([]);
     setErrorMessage("");
   }, []);
@@ -443,7 +473,13 @@ function App() {
         }
         return;
       }
-      const snapshot = (options?.snapshot ?? transcriptRef.current).trim();
+      const snapshot = (
+        options?.snapshot ??
+        [committedTranscriptRef.current, livePartialRef.current]
+          .map((s) => s.trim())
+          .filter(Boolean)
+          .join(" ")
+      ).trim();
       if (!snapshot) {
         if (!options?.silent) {
           setErrorMessage(
@@ -457,7 +493,9 @@ function App() {
       setErrorMessage("");
       const userId = crypto.randomUUID();
       setChatMessages((prev) => [...prev, { id: userId, role: "user", content: snapshot }]);
-      setTranscript("");
+      setCommittedTranscript("");
+      setLivePartial("");
+      setIsHearingSpeech(false);
       setIsSending(true);
       try {
         const prompt = buildInterviewCoachPrompt(
@@ -483,22 +521,6 @@ function App() {
   useEffect(() => {
     sendToAiRef.current = sendToAi;
   }, [sendToAi]);
-
-  /** Auto-send after silence while still listening for the next question. */
-  useEffect(() => {
-    if (!canUseAi || !isListening || isSending) return;
-    const trimmed = transcript.trim();
-    if (!trimmed) return;
-
-    const timer = window.setTimeout(() => {
-      if (!isListeningRef.current || isSendingRef.current) return;
-      const latest = transcriptRef.current.trim();
-      if (!latest) return;
-      void sendToAiRef.current({ snapshot: latest, silent: true });
-    }, AUTO_SEND_SILENCE_MS);
-
-    return () => window.clearTimeout(timer);
-  }, [canUseAi, isListening, transcript, isSending]);
 
   const regenerateLastAnswer = useCallback(async () => {
     if (!canUseAi) return;
@@ -559,7 +581,8 @@ function App() {
     await logoutRemote();
     setAuthSession(null);
     setChatMessages([]);
-    setTranscript("");
+    setCommittedTranscript("");
+    setLivePartial("");
     setErrorMessage("");
   }, []);
 
@@ -692,13 +715,19 @@ function App() {
             <UserBubble
               value={transcript}
               readOnly={false}
-              isPartialActive={isListening}
+              isPartialActive={isListening && (isHearingSpeech || !!livePartial)}
+              isTranscribing={isListening && isHearingSpeech && !livePartial}
+              livePartial={livePartial}
               placeholder={
                 canUseAi
-                  ? "Whisper transcripts appear here after each pause. Type or paste, then Send to AI (Ctrl+Enter)."
+                  ? "Speech appears here as it is transcribed. Edit if needed, then Send to AI (Ctrl+Enter) when ready — nothing is sent automatically."
                   : "Listening and typing work, but AI coaching requires access from an administrator."
               }
-              onChange={setTranscript}
+              onChange={(next) => {
+                setCommittedTranscript(next);
+                setLivePartial("");
+                setIsHearingSpeech(false);
+              }}
               onSubmit={canUseAi ? () => void sendToAi() : undefined}
             />
           </div>
@@ -996,12 +1025,13 @@ function EmptyState({ aiAllowed }: { aiAllowed: boolean }) {
           <span className="rounded bg-white/5 px-1.5 py-0.5 text-slate-200">
             Listen
           </span>{" "}
-          to capture system audio with local Whisper, or type or paste the
-          recruiter question in the box below. Then use{" "}
+          to capture system audio with local Whisper (text updates live as you
+          hear it), or type or paste the recruiter question. When you are ready,
+          use{" "}
           <span className="rounded bg-white/5 px-1.5 py-0.5 text-slate-200">
             Send to AI
           </span>{" "}
-          for a drafted answer
+          — nothing is sent until you do
           {!aiAllowed
             ? " once an administrator enables AI access for your account"
             : ""}
@@ -1032,6 +1062,8 @@ function UserBubble({
   value,
   readOnly,
   isPartialActive,
+  isTranscribing,
+  livePartial,
   onChange,
   onSubmit,
   placeholder = "Transcript will appear here…",
@@ -1039,6 +1071,8 @@ function UserBubble({
   value: string;
   readOnly?: boolean;
   isPartialActive: boolean;
+  isTranscribing?: boolean;
+  livePartial?: string;
   onChange: (next: string) => void;
   onSubmit?: () => void;
   placeholder?: string;
@@ -1059,7 +1093,11 @@ function UserBubble({
           {isPartialActive && (
             <span className="inline-flex items-center gap-1 text-emerald-300/80">
               <span className="listening-dot size-1.5!" />
-              capturing…
+              {isTranscribing
+                ? "transcribing…"
+                : livePartial
+                  ? "updating…"
+                  : "hearing speech…"}
             </span>
           )}
           <span>{readOnly ? "You · sent" : "You"}</span>
@@ -1087,7 +1125,10 @@ function UserBubble({
               placeholder={placeholder}
               spellCheck={false}
               rows={3}
-              className="block min-h-22 w-full resize-y rounded-2xl rounded-tr-sm bg-surface-2/50 px-4 py-3 text-[14px] leading-relaxed text-slate-100 placeholder:text-slate-500 backdrop-blur-md focus:outline-none"
+              className={
+                "block min-h-22 w-full resize-y rounded-2xl rounded-tr-sm bg-surface-2/50 px-4 py-3 text-[14px] leading-relaxed text-slate-100 placeholder:text-slate-500 backdrop-blur-md focus:outline-none " +
+                (livePartial ? "ring-1 ring-emerald-400/25" : "")
+              }
             />
           )}
         </div>
