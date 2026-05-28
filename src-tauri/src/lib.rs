@@ -48,6 +48,11 @@ struct SttListeningPayload {
     active: bool,
 }
 
+#[derive(Clone, Serialize)]
+struct SttCapturePayload {
+    active: bool,
+}
+
 enum ControlMessage {
     Stop,
 }
@@ -103,6 +108,10 @@ fn emit_stt_error(app: &AppHandle, message: String) {
         },
     );
     eprintln!("[stt] {message}");
+}
+
+fn emit_stt_capture(app: &AppHandle, active: bool) {
+    let _ = app.emit("stt-capture", SttCapturePayload { active });
 }
 
 #[tauri::command]
@@ -193,6 +202,9 @@ fn resolve_whisper_model_path(app: &AppHandle, model_path: String) -> Result<Str
     if let Ok(exe_path) = std::env::current_exe() {
         if let Some(exe_dir) = exe_path.parent() {
             candidates.push(exe_dir.join("models").join("whisper"));
+            if let Some(parent) = exe_dir.parent() {
+                candidates.push(parent.join("models").join("whisper"));
+            }
         }
     }
 
@@ -202,7 +214,8 @@ fn resolve_whisper_model_path(app: &AppHandle, model_path: String) -> Result<Str
         .path()
         .resolve("models/whisper", BaseDirectory::Resource)
     {
-        candidates.push(resource_path);
+        candidates.push(resource_path.clone());
+        candidates.push(resource_path.join("models").join("whisper"));
     }
 
     candidates.push(PathBuf::from("models/whisper"));
@@ -224,9 +237,10 @@ fn resolve_whisper_model_path(app: &AppHandle, model_path: String) -> Result<Str
         }
     }
 
-    Err(format!(
-        "Whisper model not found. Download ggml-base.en.bin or ggml-tiny.en.bin into src-tauri/models/whisper/ (see models/whisper/README.md)."
-    ))
+    Err(
+        "Whisper model not found in any expected location. Ensure models/whisper/*.bin is bundled for release, or place ggml-base.en.bin / ggml-tiny.en.bin in src-tauri/models/whisper/ for local runs."
+            .to_string(),
+    )
 }
 
 fn load_whisper_context(model_path: &str) -> Result<WhisperContext, String> {
@@ -657,6 +671,7 @@ fn start_listening_thread(
 
     thread::spawn(move || {
         let clear_listen_state = || {
+            emit_stt_capture(&app, false);
             if let Some(state) = app.try_state::<AppState>() {
                 if let Ok(mut guard) = state.listen_control.lock() {
                     *guard = None;
@@ -708,6 +723,7 @@ fn start_listening_thread(
             clear_listen_state();
             return;
         }
+        emit_stt_capture(&app, true);
 
         loop {
             match control_rx.recv_timeout(Duration::from_millis(200)) {

@@ -137,7 +137,7 @@ function App() {
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const transcript = useMemo(() => {
-    const committed = committedTranscript.trim();
+    const committed = committedTranscript;
     const partial = livePartial.trim();
 
     if (!committed && !partial) return "";
@@ -269,27 +269,10 @@ function App() {
     let sttUnlisten: UnlistenFn | null = null;
     let partialUnlisten: UnlistenFn | null = null;
     let listeningUnlisten: UnlistenFn | null = null;
+    let captureUnlisten: UnlistenFn | null = null;
     let errorUnlisten: UnlistenFn | null = null;
 
     const setup = async () => {
-      try {
-        setCaptureMode("Loading local Whisper model…");
-        await bootWhisperStt();
-        setWhisperReady(true);
-        setIsListening(true);
-        setCaptureMode("Local Whisper · system audio");
-        setErrorMessage("");
-      } catch (error) {
-        const message = tauriErrorMessage(
-          error,
-          "Failed to initialize local speech recognition.",
-        );
-        setErrorMessage(message);
-        setWhisperReady(false);
-        setIsListening(false);
-        setCaptureMode("Idle");
-      }
-
       sttUnlisten = await listen<string>("stt-result", (event) => {
         const text = event.payload?.trim();
         setLivePartial("");
@@ -311,11 +294,44 @@ function App() {
         setIsHearingSpeech(!!event.payload?.active);
       });
 
+      captureUnlisten = await listen<{ active: boolean }>("stt-capture", (event) => {
+        const active = !!event.payload?.active;
+        setIsListening(active);
+        if (active) {
+          setCaptureMode("Local Whisper · system audio");
+          setErrorMessage("");
+        } else {
+          setIsHearingSpeech(false);
+          setLivePartial("");
+          setCaptureMode("Idle");
+        }
+      });
+
       errorUnlisten = await listen<SttErrorPayload>("stt-error", (event) => {
         const message = event.payload?.message?.trim();
         if (!message) return;
         setErrorMessage(message);
+        setIsListening(false);
+        setIsHearingSpeech(false);
+        setLivePartial("");
+        setCaptureMode("Idle");
       });
+
+      try {
+        setCaptureMode("Loading local Whisper model…");
+        await bootWhisperStt();
+        setWhisperReady(true);
+        setErrorMessage("");
+      } catch (error) {
+        const message = tauriErrorMessage(
+          error,
+          "Failed to initialize local speech recognition.",
+        );
+        setErrorMessage(message);
+        setWhisperReady(false);
+        setIsListening(false);
+        setCaptureMode("Idle");
+      }
     };
 
     void setup();
@@ -324,6 +340,7 @@ function App() {
       if (sttUnlisten) void sttUnlisten();
       if (partialUnlisten) void partialUnlisten();
       if (listeningUnlisten) void listeningUnlisten();
+      if (captureUnlisten) void captureUnlisten();
       if (errorUnlisten) void errorUnlisten();
       void invoke("stop_interview_listening");
     };
@@ -345,8 +362,7 @@ function App() {
         setWhisperReady(true);
       }
       await invoke("start_interview_listening");
-      setIsListening(true);
-      setCaptureMode("Local Whisper · system audio");
+      setCaptureMode("Starting local Whisper capture…");
     } catch (error) {
       const message = tauriErrorMessage(error, "Failed to start listening.");
       setErrorMessage(message);
