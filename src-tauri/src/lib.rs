@@ -23,18 +23,18 @@ use windows::Win32::{
 };
 
 const WHISPER_SAMPLE_RATE: u32 = 16_000;
-const FRAME_MS: u32 = 40;
+const FRAME_MS: u32 = 20;
 /// End-of-phrase silence — long enough for natural interview pauses without splitting one question.
-const SILENCE_END_SECS: f64 = 1.2;
+const SILENCE_END_SECS: f64 = 0.6;
 /// Emit live partial transcripts while speech is still active.
-const PARTIAL_INTERVAL_SECS: f64 = 0.25;
+const PARTIAL_INTERVAL_SECS: f64 = 0.10;
 const RMS_SILENCE_THRESHOLD: f32 = 0.006;
 const MIN_UTTERANCE_SECS: f64 = 0.2;
 /// Force a final chunk if someone speaks continuously without a long pause.
 const MAX_UTTERANCE_SECS: f64 = 45.0;
 const INFERENCE_RETRIES: u32 = 2;
 const BUNDLED_WHISPER_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/whisper");
-const PREFERRED_MODELS: &[&str] = &["ggml-base.en.bin", "ggml-tiny.en.bin"];
+const PREFERRED_MODELS: &[&str] = &["ggml-tiny.en.bin", "ggml-base.en.bin"];
 /// Real GGML Whisper models are tens of MB; LFS pointer stubs are ~130 bytes.
 const MIN_WHISPER_MODEL_BYTES: u64 = 1_000_000;
 
@@ -252,7 +252,7 @@ fn whisper_thread_count() -> i32 {
     thread::available_parallelism()
         .map(|n| n.get() as i32)
         .unwrap_or(4)
-        .clamp(1, 8)
+        .clamp(1, 16)
 }
 
 fn collect_whisper_text(state: &whisper_rs::WhisperState) -> Result<String, String> {
@@ -296,6 +296,7 @@ fn run_whisper(
     params.set_print_realtime(false);
     params.set_print_timestamps(false);
     params.set_n_threads(whisper_thread_count());
+    params.set_n_max_text_ctx(16384); // helps with longer context
 
     if partial {
         params.set_no_context(true);
