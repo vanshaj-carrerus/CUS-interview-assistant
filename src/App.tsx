@@ -137,10 +137,11 @@ function App() {
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const transcript = useMemo(() => {
-    const committed = committedTranscript.trim();
+    const committed = committedTranscript;
     const partial = livePartial.trim();
     if (!partial) return committed;
-    return committed ? `${committed} ${partial}` : partial;
+    if (!committed) return partial;
+    return /\s$/.test(committed) ? `${committed}${partial}` : `${committed} ${partial}`;
   }, [committedTranscript, livePartial]);
 
   useEffect(() => {
@@ -1210,7 +1211,6 @@ function AiBubble({
                     label="More technical"
                     onClick={() => onRefine?.("technical")}
                   />
-                  <RefineButton label="STAR" onClick={() => onRefine?.("star")} />
                 </>
               )}
             </div>

@@ -25,11 +25,11 @@ use windows::Win32::{
 const WHISPER_SAMPLE_RATE: u32 = 16_000;
 const FRAME_MS: u32 = 40;
 /// End-of-phrase silence — long enough for natural interview pauses without splitting one question.
-const SILENCE_END_SECS: f64 = 2.8;
+const SILENCE_END_SECS: f64 = 1.2;
 /// Emit live partial transcripts while speech is still active.
-const PARTIAL_INTERVAL_SECS: f64 = 0.7;
-const RMS_SILENCE_THRESHOLD: f32 = 0.008;
-const MIN_UTTERANCE_SECS: f64 = 0.35;
+const PARTIAL_INTERVAL_SECS: f64 = 0.25;
+const RMS_SILENCE_THRESHOLD: f32 = 0.006;
+const MIN_UTTERANCE_SECS: f64 = 0.2;
 /// Force a final chunk if someone speaks continuously without a long pause.
 const MAX_UTTERANCE_SECS: f64 = 45.0;
 const INFERENCE_RETRIES: u32 = 2;
