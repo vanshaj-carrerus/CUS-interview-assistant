@@ -1,6 +1,6 @@
 [package]
 name = "cus-interview-assistant"
-version = "1.1.7"
+version = "1.1.8"
 description = "Ai Interview Assistant"
 authors = ["Vanshaj"]
 edition = "2021"
@@ -27,6 +27,7 @@ hound = "3.5"
 whisper-rs = "0.16"
 tokio = { version = "1", features = ["full"] }
 tauri-plugin-process = "2"
+thread-priority = "1.1.0"
 
 [patch.crates-io]
 whisper-rs-sys = { path = "third_party/whisper-rs-sys" }

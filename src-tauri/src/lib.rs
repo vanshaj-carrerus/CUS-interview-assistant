@@ -10,6 +10,7 @@ use std::thread;
 use std::time::Duration;
 use tauri::path::BaseDirectory;
 use tauri::{AppHandle, Emitter, Manager, State};
+use thread_priority::{set_current_thread_priority, ThreadPriority};
 use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters,
 };
@@ -28,6 +29,8 @@ const FRAME_MS: u32 = 20;
 const SILENCE_END_SECS: f64 = 0.6;
 /// Emit live partial transcripts while speech is still active.
 const PARTIAL_INTERVAL_SECS: f64 = 0.10;
+/// Keep partial decode bounded so long speech does not reprocess huge buffers.
+const PARTIAL_WINDOW_SECS: f64 = 6.0;
 const RMS_SILENCE_THRESHOLD: f32 = 0.006;
 const MIN_UTTERANCE_SECS: f64 = 0.2;
 /// Force a final chunk if someone speaks continuously without a long pause.
@@ -252,7 +255,13 @@ fn whisper_thread_count() -> i32 {
     thread::available_parallelism()
         .map(|n| n.get() as i32)
         .unwrap_or(4)
-        .clamp(1, 16)
+        .clamp(1, 12)
+}
+
+fn set_stt_thread_priority(label: &str) {
+    if let Err(err) = set_current_thread_priority(ThreadPriority::Max) {
+        eprintln!("[stt] Failed to raise thread priority for {label}: {err}");
+    }
 }
 
 fn collect_whisper_text(state: &whisper_rs::WhisperState) -> Result<String, String> {
@@ -296,7 +305,6 @@ fn run_whisper(
     params.set_print_realtime(false);
     params.set_print_timestamps(false);
     params.set_n_threads(whisper_thread_count());
-    params.set_n_max_text_ctx(16384); // helps with longer context
 
     if partial {
         params.set_no_context(true);
@@ -400,6 +408,10 @@ impl VadBuffer {
         (WHISPER_SAMPLE_RATE as f64 * PARTIAL_INTERVAL_SECS) as usize
     }
 
+    fn partial_window_samples() -> usize {
+        (WHISPER_SAMPLE_RATE as f64 * PARTIAL_WINDOW_SECS) as usize
+    }
+
     fn max_utterance_samples() -> usize {
         (WHISPER_SAMPLE_RATE as f64 * MAX_UTTERANCE_SECS) as usize
     }
@@ -434,7 +446,9 @@ impl VadBuffer {
         }
         self.samples_since_partial = 0;
         self.partial_seq = self.partial_seq.wrapping_add(1);
-        Some((self.utterance.clone(), self.partial_seq))
+        let window = Self::partial_window_samples();
+        let start = self.utterance.len().saturating_sub(window);
+        Some((self.utterance[start..].to_vec(), self.partial_seq))
     }
 
     fn push_frame(&mut self, frame: &[f32]) -> VadEvent {
@@ -515,6 +529,7 @@ fn run_inference_worker(
     app: AppHandle,
     inference_rx: Receiver<InferenceMessage>,
 ) {
+    set_stt_thread_priority("inference");
     let latest_partial_id = Arc::new(AtomicU64::new(0));
 
     loop {
@@ -667,10 +682,12 @@ fn start_listening_thread(
     let inference_ctx = Arc::clone(&ctx);
 
     thread::spawn(move || {
+        set_stt_thread_priority("inference-spawn");
         run_inference_worker(inference_ctx, inference_app, inference_rx);
     });
 
     thread::spawn(move || {
+        set_stt_thread_priority("audio-capture");
         let clear_listen_state = || {
             emit_stt_capture(&app, false);
             if let Some(state) = app.try_state::<AppState>() {
