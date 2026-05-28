@@ -137,11 +137,14 @@ function App() {
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const transcript = useMemo(() => {
-    const committed = committedTranscript;
+    const committed = committedTranscript.trim();
     const partial = livePartial.trim();
+
+    if (!committed && !partial) return "";
     if (!partial) return committed;
     if (!committed) return partial;
-    return /\s$/.test(committed) ? `${committed}${partial}` : `${committed} ${partial}`;
+
+    return `${committed} ${partial}`;
   }, [committedTranscript, livePartial]);
 
   useEffect(() => {
