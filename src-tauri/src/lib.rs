@@ -37,7 +37,11 @@ const MIN_UTTERANCE_SECS: f64 = 0.2;
 const MAX_UTTERANCE_SECS: f64 = 45.0;
 const INFERENCE_RETRIES: u32 = 2;
 const BUNDLED_WHISPER_ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/models/whisper");
-const PREFERRED_MODELS: &[&str] = &["ggml-tiny.en.bin", "ggml-base.en.bin"];
+const PREFERRED_MODELS: &[&str] = &[
+    "ggml-tiny.en-q8_0.bin",
+    "ggml-tiny.en.bin",
+    "ggml-base.en.bin",
+];
 /// Real GGML Whisper models are tens of MB; LFS pointer stubs are ~130 bytes.
 const MIN_WHISPER_MODEL_BYTES: u64 = 1_000_000;
 
