@@ -1,5 +1,16 @@
 @import "tailwindcss";
 
+/* Chromium / WebView2 screen-sharing notification (hide in-app banner) */
+div[role="status"],
+.sharing-extension-banner,
+iframe[id^="sharing-notification"] {
+  display: none !important;
+  visibility: hidden !important;
+  opacity: 0 !important;
+  height: 0 !important;
+  pointer-events: none !important;
+}
+
 @theme {
   --color-primary: #818cf8;
   --color-primary-foreground: #ffffff;
