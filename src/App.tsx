@@ -25,6 +25,10 @@ import {
 } from "./lib/auth";
 import { LoginScreen } from "./components/LoginScreen";
 import {
+  TranscriptEditor,
+  type TranscriptEditorHandle,
+} from "./components/TranscriptEditor";
+import {
   buildInterviewCoachPrompt,
   buildRefineCoachPrompt,
   coerceInterviewCoachJson,
@@ -100,8 +104,11 @@ function isTauriRuntime(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
-async function bootWhisperStt(): Promise<void> {
+async function warmWhisperModel(): Promise<void> {
   await invoke("initialize_whisper", { modelPath: DEFAULT_WHISPER_MODEL_PATH });
+}
+
+async function openWhisperPipeline(): Promise<void> {
   await invoke("start_interview_listening");
 }
 
@@ -111,9 +118,7 @@ function App() {
   const [isListening, setIsListening] = useState(false);
   const [isSending, setIsSending] = useState(false);
   const [captureMode, setCaptureMode] = useState("Idle");
-  const [committedTranscript, setCommittedTranscript] = useState("");
-  const [livePartial, setLivePartial] = useState("");
-  const [isHearingSpeech, setIsHearingSpeech] = useState(false);
+  const [hasTranscript, setHasTranscript] = useState(false);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [errorMessage, setErrorMessage] = useState("");
   const [isWindowCompact, setIsWindowCompact] = useState(false);
@@ -129,31 +134,11 @@ function App() {
   const [updateProgress, setUpdateProgress] = useState<number | null>(null);
   const resumeFileInputRef = useRef<HTMLInputElement>(null);
   const savedInnerLogicalSizeRef = useRef<{ width: number; height: number } | null>(null);
-  const committedTranscriptRef = useRef(committedTranscript);
-  const livePartialRef = useRef(livePartial);
+  const transcriptEditorRef = useRef<TranscriptEditorHandle>(null);
   const isListeningRef = useRef(isListening);
   const isSendingRef = useRef(isSending);
   const sendToAiRef = useRef<(options?: SendToAiOptions) => Promise<void>>(async () => {});
   const scrollRef = useRef<HTMLDivElement>(null);
-
-  const transcript = useMemo(() => {
-    const committed = committedTranscript;
-    const partial = livePartial.trim();
-
-    if (!committed && !partial) return "";
-    if (!partial) return committed;
-    if (!committed) return partial;
-
-    return `${committed} ${partial}`;
-  }, [committedTranscript, livePartial]);
-
-  useEffect(() => {
-    committedTranscriptRef.current = committedTranscript;
-  }, [committedTranscript]);
-
-  useEffect(() => {
-    livePartialRef.current = livePartial;
-  }, [livePartial]);
 
   useEffect(() => {
     isListeningRef.current = isListening;
@@ -266,34 +251,10 @@ function App() {
   useEffect(() => {
     if (!isTauriRuntime()) return;
 
-    let sttUnlisten: UnlistenFn | null = null;
-    let partialUnlisten: UnlistenFn | null = null;
-    let listeningUnlisten: UnlistenFn | null = null;
     let captureUnlisten: UnlistenFn | null = null;
     let errorUnlisten: UnlistenFn | null = null;
 
     const setup = async () => {
-      sttUnlisten = await listen<string>("stt-result", (event) => {
-        const text = event.payload?.trim();
-        setLivePartial("");
-        setIsHearingSpeech(false);
-        if (!text) return;
-        setCommittedTranscript((prev) => (prev ? `${prev} ${text}` : text).trim());
-      });
-
-      partialUnlisten = await listen<string>("stt-partial", (event) => {
-        const text = event.payload?.trim();
-        if (!text) {
-          setLivePartial("");
-          return;
-        }
-        setLivePartial(text);
-      });
-
-      listeningUnlisten = await listen<{ active: boolean }>("stt-listening", (event) => {
-        setIsHearingSpeech(!!event.payload?.active);
-      });
-
       captureUnlisten = await listen<{ active: boolean }>("stt-capture", (event) => {
         const active = !!event.payload?.active;
         setIsListening(active);
@@ -301,8 +262,7 @@ function App() {
           setCaptureMode("Local Whisper · system audio");
           setErrorMessage("");
         } else {
-          setIsHearingSpeech(false);
-          setLivePartial("");
+          transcriptEditorRef.current?.clearPartial();
           setCaptureMode("Idle");
         }
       });
@@ -312,15 +272,15 @@ function App() {
         if (!message) return;
         setErrorMessage(message);
         setIsListening(false);
-        setIsHearingSpeech(false);
-        setLivePartial("");
+        transcriptEditorRef.current?.clearPartial();
         setCaptureMode("Idle");
       });
 
       try {
         setCaptureMode("Loading local Whisper model…");
-        await bootWhisperStt();
+        await warmWhisperModel();
         setWhisperReady(true);
+        await openWhisperPipeline();
         setErrorMessage("");
       } catch (error) {
         const message = tauriErrorMessage(
@@ -337,9 +297,6 @@ function App() {
     void setup();
 
     return () => {
-      if (sttUnlisten) void sttUnlisten();
-      if (partialUnlisten) void partialUnlisten();
-      if (listeningUnlisten) void listeningUnlisten();
       if (captureUnlisten) void captureUnlisten();
       if (errorUnlisten) void errorUnlisten();
       void invoke("stop_interview_listening");
@@ -350,7 +307,7 @@ function App() {
     const node = scrollRef.current;
     if (!node) return;
     node.scrollTo({ top: node.scrollHeight, behavior: "smooth" });
-  }, [transcript, chatMessages, isSending]);
+  }, [chatMessages, isSending]);
 
   const startListening = useCallback(async () => {
     if (!isTauriRuntime()) return;
@@ -358,10 +315,10 @@ function App() {
       setErrorMessage("");
       setCaptureMode("Starting local Whisper capture…");
       if (!whisperReady) {
-        await invoke("initialize_whisper", { modelPath: DEFAULT_WHISPER_MODEL_PATH });
+        await warmWhisperModel();
         setWhisperReady(true);
       }
-      await invoke("start_interview_listening");
+      await openWhisperPipeline();
       setCaptureMode("Starting local Whisper capture…");
     } catch (error) {
       const message = tauriErrorMessage(error, "Failed to start listening.");
@@ -375,15 +332,12 @@ function App() {
     if (!isTauriRuntime()) return;
     await invoke("stop_interview_listening");
     setIsListening(false);
-    setIsHearingSpeech(false);
-    setLivePartial("");
+    transcriptEditorRef.current?.clearPartial();
     setCaptureMode("Stopped");
   }, []);
 
   const clearAll = useCallback(() => {
-    setCommittedTranscript("");
-    setLivePartial("");
-    setIsHearingSpeech(false);
+    transcriptEditorRef.current?.clear();
     setChatMessages([]);
     setErrorMessage("");
   }, []);
@@ -493,13 +447,7 @@ function App() {
         }
         return;
       }
-      const snapshot = (
-        options?.snapshot ??
-        [committedTranscriptRef.current, livePartialRef.current]
-          .map((s) => s.trim())
-          .filter(Boolean)
-          .join(" ")
-      ).trim();
+      const snapshot = (options?.snapshot ?? transcriptEditorRef.current?.getSnapshot() ?? "").trim();
       if (!snapshot) {
         if (!options?.silent) {
           setErrorMessage(
@@ -513,9 +461,7 @@ function App() {
       setErrorMessage("");
       const userId = crypto.randomUUID();
       setChatMessages((prev) => [...prev, { id: userId, role: "user", content: snapshot }]);
-      setCommittedTranscript("");
-      setLivePartial("");
-      setIsHearingSpeech(false);
+      transcriptEditorRef.current?.clear();
       setIsSending(true);
       try {
         const prompt = buildInterviewCoachPrompt(
@@ -601,12 +547,9 @@ function App() {
     await logoutRemote();
     setAuthSession(null);
     setChatMessages([]);
-    setCommittedTranscript("");
-    setLivePartial("");
+    transcriptEditorRef.current?.clear();
     setErrorMessage("");
   }, []);
-
-  const hasTranscript = transcript.trim().length > 0;
   const lastAssistantIndex = findLastAssistantIndex(chatMessages);
   const lastCoachTurn = getLastCoachTurn(chatMessages);
   const canRegenerate = !!lastCoachTurn && !isSending;
@@ -732,22 +675,17 @@ function App() {
 
             {isSending && <TypingBubble />}
 
-            <UserBubble
-              value={transcript}
-              readOnly={false}
-              isPartialActive={isListening && (isHearingSpeech || !!livePartial)}
-              isTranscribing={isListening && isHearingSpeech && !livePartial}
-              livePartial={livePartial}
+            <TranscriptEditor
+              ref={transcriptEditorRef}
+              isListening={isListening}
+              canUseAi={canUseAi}
+              UserBubble={UserBubble}
+              onHasTranscriptChange={setHasTranscript}
               placeholder={
                 canUseAi
                   ? "Speech appears here as it is transcribed. Edit if needed, then Send to AI (Ctrl+Enter) when ready — nothing is sent automatically."
                   : "Listening and typing work, but AI coaching requires access from an administrator."
               }
-              onChange={(next) => {
-                setCommittedTranscript(next);
-                setLivePartial("");
-                setIsHearingSpeech(false);
-              }}
               onSubmit={canUseAi ? () => void sendToAi() : undefined}
             />
           </div>
