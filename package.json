@@ -1,13 +1,15 @@
 {
   "name": "cus-interview-assistant",
   "private": true,
-  "version": "1.1.10",
+  "version": "1.1.11",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
+    "env:sync": "powershell -ExecutionPolicy Bypass -NoProfile -File ./scripts/sync-github-env.ps1",
+    "tauri:dev": "powershell -ExecutionPolicy Bypass -NoProfile -File ./scripts/tauri-dev.ps1",
     "tauri:build:production": "powershell -ExecutionPolicy Bypass -NoProfile -File ./scripts/tauri-build-production.ps1",
     "tauri:build:signed": "powershell -ExecutionPolicy Bypass -NoProfile -File ./scripts/tauri-build-signed.ps1",
     "test:api": "powershell -ExecutionPolicy Bypass -NoProfile -File ./scripts/test-production-auth.ps1"

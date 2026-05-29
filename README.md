@@ -1,129 +1,73 @@
 # CUS Interview Assistant
 
-Local interview coach (Tauri v2 + React) with **offline speech-to-text** via [whisper.cpp](https://github.com/ggerganov/whisper.cpp) (`whisper-rs`) and system-audio capture via `cpal`.
+Interview coach (Tauri v2 + React) with **Groq Whisper** speech-to-text: the frontend records ~2 second audio chunks and sends them to Groq’s `whisper-large-v3-turbo` API (very fast on Groq hardware). Audio is captured in the browser via `getDisplayMedia` / `getUserMedia`.
 
-**Security:** For users outside your org, use the **hosted API** model — secrets stay on `server/`, not in the installer. See **[SECURITY.md](SECURITY.md)**.
+**Security:** Interview **AI coaching** runs on your hosted `server/` (JWT, MongoDB, model keys). The **Groq API key** is only used client-side for live transcription — set it in `src-tauri/.env` at build time (see below).
 
 ## Prerequisites (Windows)
 
 1. **Rust** — [rustup](https://rustup.rs/)
 2. **Node.js** — LTS for the Vite frontend
-3. **Visual Studio Build Tools** — “Desktop development with C++” workload
-4. **CMake** — `winget install Kitware.CMake` or [cmake.org](https://cmake.org/download/)
-5. **LLVM / libclang** (required to compile `whisper-rs`) — `winget install LLVM.LLVM`, then ensure `LIBCLANG_PATH` points at the LLVM `bin` folder if bindgen cannot find `libclang.dll`
+3. **Visual Studio Build Tools** — “Desktop development with C++” workload (for Tauri)
 
-## Whisper model (required, offline)
+## Speech-to-text (Groq)
 
-Download a GGML English model into `src-tauri/models/whisper/`:
+1. Create an API key at [Groq Console](https://console.groq.com/).
+2. Add it as a **GitHub repository secret**: `VITE_GROQ_API_KEY` or `GROQ_API_KEY` (Settings → Secrets and variables → Actions).
+3. **Local dev** — sync secrets into `src-tauri/.env` (gitignored):
 
-- [ggml-base.en.bin](https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin) (recommended)
-- [ggml-tiny.en.bin](https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin) (faster, less accurate)
+   ```powershell
+   winget install GitHub.cli   # once
+   gh auth login
+   npm run env:sync            # downloads dev.env from Actions using repo secrets
+   npm run tauri:dev           # sync + tauri dev
+   ```
 
-See `src-tauri/models/whisper/README.md` for layout details.
+   `env:sync` runs the `dev-env-export` workflow and writes `src-tauri/.env`. Re-run with `npm run env:sync -- -Force` to refresh.
 
-### Git LFS (repository includes bundled models)
+4. **Audio source** (optional):
+   - `VITE_STT_AUDIO_SOURCE=display` (default) — share your interview **tab or screen with system audio**.
+   - `VITE_STT_AUDIO_SOURCE=microphone` — microphone only.
 
-Whisper `.bin` files are stored with [Git LFS](https://git-lfs.com/) (GitHub rejects them as normal Git blobs).
-
-**One-time on your machine:**
-
-```powershell
-winget install GitHub.GitLFS
-git lfs install
-```
-
-**Clone or pull models:**
-
-```bash
-git clone https://github.com/vanshaj-carrerus/CUS-interview-assistant.git
-cd CUS-interview-assistant
-git lfs pull
-```
-
-If models are missing after clone, run `git lfs pull` in the repo root.
+Click **Listen**, pick the tab/window with audio when prompted. Every ~2 seconds a chunk is transcribed and appended to the transcript (latest chunk also flashes as a live partial while Groq responds).
 
 ## Authentication and API (production)
 
 ```text
 Desktop app  ──HTTPS──►  Your hosted server/  ──►  MongoDB Atlas
      │                         │
-     └── Whisper (local)       └── AI keys, JWT, admin secrets
+     └── Groq Whisper (STT)    └── AI keys, JWT, admin secrets
 ```
 
-1. **Deploy** the Node API in `server/` (see [server/README.md](server/README.md)). Put all secrets in `server/.env` on the host.
-2. **Build** the desktop app with only the public API URL:
+1. **Deploy** the Node API in `server/` (see [server/README.md](server/README.md)).
+2. **Build** the desktop app (local or CI):
 
    ```powershell
    cp src-tauri/.env.example src-tauri/.env
-   # Edit: VITE_API_URL=https://api.yourcompany.com
+   # VITE_API_URL=https://api.yourcompany.com
+   # VITE_GROQ_API_KEY=...
    npm run tauri:build:production
    ```
 
-3. **Control access:** set `ALLOW_REGISTRATION=false` on the server; create users via seed or MongoDB. Enable AI per user with `aiAllowed: true` (Atlas or admin `PATCH`).
+   **GitHub Actions:** add repository secret `VITE_GROQ_API_KEY` or `GROQ_API_KEY` (same value). The release workflow injects it into the Vite build so the installed app has STT without a local `.env`.
 
-Users sign in inside the app. They only receive a **session token** — not database or AI credentials.
-
-### Turning on AI for a session
-
-1. User signs in (`aiAllowed` is reset to `false` on every sign-in).
-2. You set `aiAllowed: true` in MongoDB or via admin API while they use the app (polls every ~22s and on window focus).
-3. Sign-out clears `sessionId` so the same email can sign in elsewhere. One active session per email (no two devices at once).
+3. Enable AI per user with `aiAllowed: true` on the server.
 
 ## Development
 
-### Option A — Remote API (recommended, same as production)
-
 ```bash
 npm install
-npm run server:install
-cp server/.env.example server/.env
-# edit server/.env
+gh auth login
+npm run env:sync      # pulls VITE_GROQ_API_KEY from GitHub secrets → src-tauri/.env
 
-cp src-tauri/.env.example src-tauri/.env
-# VITE_API_URL=http://localhost:3001
-
-npm run server:dev    # terminal 1
-npm run tauri dev     # terminal 2
+npm run server:dev    # terminal 1 (if using remote API)
+npm run tauri:dev     # terminal 2 (or: npm run tauri dev after env:sync)
 ```
 
-### Option B — Embedded API (local only, not for release)
+To use a local API URL, set `VITE_API_URL=http://localhost:3001` in `src-tauri/.env` before or after `env:sync` (sync preserves your existing `VITE_API_URL`).
 
-```bash
-cp src-tauri/backend.env.example src-tauri/backend.env
-# edit backend.env (MongoDB + JWT + AI keys)
-npm run tauri dev
-# Do not set VITE_API_URL
-```
+Press **Listen** to start chunk transcription. **Send to AI** (Ctrl+Enter) only when you are ready — nothing is auto-sent.
 
-On launch the app loads Whisper and starts system-audio listening. Live partial text is streamed (`stt-partial` while speech is active); finalized phrases append on `stt-result` after ~2.8s of silence (tolerant of natural interview pauses). Send to AI only when you press **Send to AI** or Ctrl+Enter — nothing is auto-sent.
+## Removed: local Whisper / cpal / Deepgram
 
-### Windows build notes
-
-- `src-tauri/.cargo/config.toml` sets `LIBCLANG_PATH` for bindgen (adjust if LLVM is installed elsewhere).
-- `src-tauri/third_party/whisper-rs-sys` is a small patched copy of `whisper-rs-sys` so MSVC builds succeed (enum + glibc layout fixes).
-- If you previously set `WHISPER_DONT_GENERATE_BINDINGS` in your shell, remove it: `Remove-Item Env:WHISPER_DONT_GENERATE_BINDINGS -ErrorAction SilentlyContinue`
-- First compile of Whisper takes several minutes; later `tauri dev` starts much faster.
-
-### Release build (Windows, with updater signing)
-
-`tauri.conf.json` has `createUpdaterArtifacts: true`, so a full build needs the **same** private key as GitHub (`TAURI_SIGNING_PRIVATE_KEY` secret).
-
-1. Set `VITE_API_URL` in `src-tauri/.env` (HTTPS for real users).
-2. Put your minisign private key at **`%USERPROFILE%\.tauri\myapp.key`**, or set `TAURI_PRIVATE_KEY_FILE`.
-3. Run:
-
-   ```powershell
-   npm run tauri:build:signed
-   ```
-
-   Unsigned production build:
-
-   ```powershell
-   npm run tauri:build:production
-   ```
-
-Do **not** commit `myapp.key` or `server/.env` / `src-tauri/backend.env`.
-
-## Removed: Vosk
-
-Vosk binaries and `src-tauri/vosk/` are no longer used. You may delete `src-tauri/vosk/` and `src-tauri/models/vosk-model/` locally to reclaim disk space.
+The desktop app no longer bundles whisper.cpp or uses Deepgram. You may delete `src-tauri/models/whisper/` and `src-tauri/third_party/whisper-rs-sys/` locally to reclaim disk space.

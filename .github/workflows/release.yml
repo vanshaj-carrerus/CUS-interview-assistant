@@ -36,15 +36,29 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # Groq is required for client-side STT (Whisper chunks). Accept either secret name.
+      - name: Prepare Groq STT env for build
+        shell: pwsh
+        run: |
+          $key = '${{ secrets.VITE_GROQ_API_KEY }}'.Trim()
+          if ([string]::IsNullOrWhiteSpace($key)) {
+            $key = '${{ secrets.GROQ_API_KEY }}'.Trim()
+          }
+          if ([string]::IsNullOrWhiteSpace($key)) {
+            Write-Error 'Set repository secret VITE_GROQ_API_KEY or GROQ_API_KEY (Groq console API key).'
+          }
+          "VITE_GROQ_API_KEY=$key" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "GROQ_API_KEY=$key" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
       - name: Build and publish release (with updater artifacts)
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # Public API base (not a secret). vite.config.ts defaults to this if unset.
           VITE_API_URL: https://www.custech.co
-          # Do not set VITE_*_API_KEY here — release builds fail if they are present (see SECURITY.md).
+          VITE_GROQ_API_KEY: ${{ env.VITE_GROQ_API_KEY }}
+          GROQ_API_KEY: ${{ env.GROQ_API_KEY }}
           CARGO_BUILD_JOBS: 4
           RUSTFLAGS: '-C target-feature=+crt-static'
         with:

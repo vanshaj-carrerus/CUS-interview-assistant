@@ -1,0 +1,38 @@
+# Exports repo secrets into a short-lived artifact so local devs can sync src-tauri/.env via `npm run env:sync`.
+# GitHub does not allow reading secret values from the API; this workflow is the supported bridge.
+name: Dev env export
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve Groq key from secrets
+        shell: bash
+        env:
+          VITE_KEY: ${{ secrets.VITE_GROQ_API_KEY }}
+          GROQ_KEY: ${{ secrets.GROQ_API_KEY }}
+        run: |
+          KEY="${VITE_KEY:-$GROQ_KEY}"
+          if [ -z "$KEY" ]; then
+            echo "::error::Set repository secret VITE_GROQ_API_KEY or GROQ_API_KEY"
+            exit 1
+          fi
+          echo "::add-mask::$KEY"
+          mkdir -p out
+          {
+            echo "VITE_API_URL=https://www.custech.co"
+            echo "VITE_GROQ_API_KEY=$KEY"
+          } > out/dev.env
+
+      - name: Upload dev.env artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dev-env
+          path: out/dev.env
+          retention-days: 1

@@ -1,6 +1,4 @@
 import { LogicalSize } from "@tauri-apps/api/dpi";
-import { invoke } from "@tauri-apps/api/core";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   useCallback,
@@ -28,6 +26,8 @@ import {
   TranscriptEditor,
   type TranscriptEditorHandle,
 } from "./components/TranscriptEditor";
+import { useCloudStt } from "./hooks/useCloudStt";
+import { ensureSttKeyLoaded } from "./lib/sttConfig";
 import {
   buildInterviewCoachPrompt,
   buildRefineCoachPrompt,
@@ -83,13 +83,6 @@ function getLastCoachTurn(messages: ChatMessage[]): {
   };
 }
 
-type SttErrorPayload = {
-  message: string;
-};
-
-/** Empty string lets the backend resolve bundled `models/whisper/*.bin`. */
-const DEFAULT_WHISPER_MODEL_PATH = "";
-
 /** Inner limits — keep in sync with `src-tauri/tauri.conf.json` window `minWidth` / `minHeight`. */
 const WINDOW_MIN_INNER = { width: 340, height: 260 };
 const WINDOW_DEFAULT_INNER = { width: 600, height: 600 };
@@ -104,25 +97,14 @@ function isTauriRuntime(): boolean {
   return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 }
 
-async function warmWhisperModel(): Promise<void> {
-  await invoke("initialize_whisper", { modelPath: DEFAULT_WHISPER_MODEL_PATH });
-}
-
-async function openWhisperPipeline(): Promise<void> {
-  await invoke("start_interview_listening");
-}
-
 function App() {
   const [authSession, setAuthSession] = useState<AuthSession | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
-  const [isListening, setIsListening] = useState(false);
   const [isSending, setIsSending] = useState(false);
-  const [captureMode, setCaptureMode] = useState("Idle");
   const [hasTranscript, setHasTranscript] = useState(false);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [errorMessage, setErrorMessage] = useState("");
   const [isWindowCompact, setIsWindowCompact] = useState(false);
-  const [whisperReady, setWhisperReady] = useState(false);
   const [resume, setResume] = useState<StoredResume | null>(() => loadStoredResume());
   const [resumePanelOpen, setResumePanelOpen] = useState(false);
   const [resumePaste, setResumePaste] = useState("");
@@ -135,6 +117,19 @@ function App() {
   const resumeFileInputRef = useRef<HTMLInputElement>(null);
   const savedInnerLogicalSizeRef = useRef<{ width: number; height: number } | null>(null);
   const transcriptEditorRef = useRef<TranscriptEditorHandle>(null);
+  const getEditorBridge = useCallback(
+    () => transcriptEditorRef.current,
+    [],
+  );
+  const {
+    isListening,
+    captureMode,
+    startListening,
+    stopListening,
+  } = useCloudStt({
+    getEditorBridge,
+    onError: (message) => setErrorMessage(message),
+  });
   const isListeningRef = useRef(isListening);
   const isSendingRef = useRef(isSending);
   const sendToAiRef = useRef<(options?: SendToAiOptions) => Promise<void>>(async () => {});
@@ -250,58 +245,11 @@ function App() {
 
   useEffect(() => {
     if (!isTauriRuntime()) return;
-
-    let captureUnlisten: UnlistenFn | null = null;
-    let errorUnlisten: UnlistenFn | null = null;
-
-    const setup = async () => {
-      captureUnlisten = await listen<{ active: boolean }>("stt-capture", (event) => {
-        const active = !!event.payload?.active;
-        setIsListening(active);
-        if (active) {
-          setCaptureMode("Local Whisper · system audio");
-          setErrorMessage("");
-        } else {
-          transcriptEditorRef.current?.clearPartial();
-          setCaptureMode("Idle");
-        }
-      });
-
-      errorUnlisten = await listen<SttErrorPayload>("stt-error", (event) => {
-        const message = event.payload?.message?.trim();
-        if (!message) return;
-        setErrorMessage(message);
-        setIsListening(false);
-        transcriptEditorRef.current?.clearPartial();
-        setCaptureMode("Idle");
-      });
-
-      try {
-        setCaptureMode("Loading local Whisper model…");
-        await warmWhisperModel();
-        setWhisperReady(true);
-        await openWhisperPipeline();
-        setErrorMessage("");
-      } catch (error) {
-        const message = tauriErrorMessage(
-          error,
-          "Failed to initialize local speech recognition.",
-        );
-        setErrorMessage(message);
-        setWhisperReady(false);
-        setIsListening(false);
-        setCaptureMode("Idle");
-      }
-    };
-
-    void setup();
-
+    void ensureSttKeyLoaded();
     return () => {
-      if (captureUnlisten) void captureUnlisten();
-      if (errorUnlisten) void errorUnlisten();
-      void invoke("stop_interview_listening");
+      void stopListening();
     };
-  }, []);
+  }, [stopListening]);
 
   useEffect(() => {
     const node = scrollRef.current;
@@ -309,32 +257,21 @@ function App() {
     node.scrollTo({ top: node.scrollHeight, behavior: "smooth" });
   }, [chatMessages, isSending]);
 
-  const startListening = useCallback(async () => {
+  const handleStartListening = useCallback(async () => {
     if (!isTauriRuntime()) return;
+    setErrorMessage("");
     try {
-      setErrorMessage("");
-      setCaptureMode("Starting local Whisper capture…");
-      if (!whisperReady) {
-        await warmWhisperModel();
-        setWhisperReady(true);
-      }
-      await openWhisperPipeline();
-      setCaptureMode("Starting local Whisper capture…");
+      await startListening();
     } catch (error) {
       const message = tauriErrorMessage(error, "Failed to start listening.");
-      setErrorMessage(message);
-      setIsListening(false);
-      setCaptureMode("Idle");
+      setErrorMessage((prev) => prev || message);
     }
-  }, [whisperReady]);
+  }, [startListening]);
 
-  const stopListening = useCallback(async () => {
+  const handleStopListening = useCallback(async () => {
     if (!isTauriRuntime()) return;
-    await invoke("stop_interview_listening");
-    setIsListening(false);
-    transcriptEditorRef.current?.clearPartial();
-    setCaptureMode("Stopped");
-  }, []);
+    await stopListening();
+  }, [stopListening]);
 
   const clearAll = useCallback(() => {
     transcriptEditorRef.current?.clear();
@@ -570,8 +507,8 @@ function App() {
 
       if (e.key === "l" || e.key === "L") {
         e.preventDefault();
-        if (isListening) void stopListening();
-        else void startListening();
+        if (isListening) void handleStopListening();
+        else void handleStartListening();
         return;
       }
 
@@ -590,8 +527,8 @@ function App() {
     canUseAi,
     sendToAi,
     clearAll,
-    startListening,
-    stopListening,
+    handleStartListening,
+    handleStopListening,
   ]);
   const showEmptyState = chatMessages.length === 0 && !hasTranscript;
 
@@ -704,8 +641,8 @@ function App() {
         isSending={isSending}
         canSend={hasTranscript && canUseAi}
         aiAllowed={canUseAi}
-        onStart={startListening}
-        onStop={stopListening}
+        onStart={handleStartListening}
+        onStop={handleStopListening}
         onSend={sendToAi}
         onClear={clearAll}
       />
@@ -983,8 +920,8 @@ function EmptyState({ aiAllowed }: { aiAllowed: boolean }) {
           <span className="rounded bg-white/5 px-1.5 py-0.5 text-slate-200">
             Listen
           </span>{" "}
-          to capture system audio with local Whisper (text updates live as you
-          hear it), or type or paste the recruiter question. When you are ready,
+          to transcribe speech with Groq Whisper (share your interview tab with
+          audio, or use microphone mode), or type or paste the recruiter question. When you are ready,
           use{" "}
           <span className="rounded bg-white/5 px-1.5 py-0.5 text-slate-200">
             Send to AI

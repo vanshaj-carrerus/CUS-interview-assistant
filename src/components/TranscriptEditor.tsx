@@ -7,13 +7,12 @@ import {
   forwardRef,
   type ReactNode,
 } from "react";
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { useSttTranscript } from "../hooks/useSttTranscript";
+import type { CloudSttEditorBridge } from "../hooks/useCloudStt";
 
-export type TranscriptEditorHandle = {
+export type TranscriptEditorHandle = CloudSttEditorBridge & {
   getSnapshot: () => string;
   clear: () => void;
-  clearPartial: () => void;
 };
 
 type UserBubbleProps = {
@@ -35,10 +34,6 @@ type TranscriptEditorProps = {
   onHasTranscriptChange?: (has: boolean) => void;
   UserBubble: (props: UserBubbleProps) => ReactNode;
 };
-
-function isTauriRuntime(): boolean {
-  return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
-}
 
 export const TranscriptEditor = memo(
   forwardRef<TranscriptEditorHandle, TranscriptEditorProps>(function TranscriptEditor(
@@ -84,8 +79,17 @@ export const TranscriptEditor = memo(
         getSnapshot,
         clear: clearTranscript,
         clearPartial,
+        setPartial,
+        appendCommitted,
+        setHearingSpeech,
       }),
-      [getSnapshot, clearTranscript, clearPartial],
+      [
+        getSnapshot,
+        clearTranscript,
+        clearPartial,
+        setPartial,
+        appendCommitted,
+      ],
     );
 
     useEffect(() => {
@@ -93,46 +97,18 @@ export const TranscriptEditor = memo(
     }, [hasTranscript, onHasTranscriptChange]);
 
     useEffect(() => {
-      if (!isTauriRuntime()) return;
-
-      let sttUnlisten: UnlistenFn | null = null;
-      let partialUnlisten: UnlistenFn | null = null;
-      let listeningUnlisten: UnlistenFn | null = null;
-
-      const setup = async () => {
-        sttUnlisten = await listen<string>("stt-result", (event) => {
-          const text = event.payload?.trim();
-          setPartial("");
-          setHearingSpeech(false);
-          if (text) appendCommitted(text);
-        });
-
-        partialUnlisten = await listen<string>("stt-partial", (event) => {
-          const text = event.payload?.trim();
-          setPartial(text ?? "");
-        });
-
-        listeningUnlisten = await listen<{ active: boolean }>("stt-listening", (event) => {
-          setHearingSpeech(!!event.payload?.active);
-        });
-      };
-
-      void setup();
-
-      return () => {
-        if (sttUnlisten) void sttUnlisten();
-        if (partialUnlisten) void partialUnlisten();
-        if (listeningUnlisten) void listeningUnlisten();
-        if (hearingTimerRef.current) clearTimeout(hearingTimerRef.current);
-      };
-    }, [appendCommitted, setPartial]);
-
-    useEffect(() => {
       if (!isListening) {
         setHearingSpeech(false);
         clearPartial();
       }
     }, [isListening, clearPartial]);
+
+    useEffect(
+      () => () => {
+        if (hearingTimerRef.current) clearTimeout(hearingTimerRef.current);
+      },
+      [],
+    );
 
     return UserBubble({
       value: transcript,
