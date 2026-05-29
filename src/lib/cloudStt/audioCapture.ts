@@ -6,26 +6,50 @@ const RECORDER_MIME_CANDIDATES = [
   "audio/ogg;codecs=opus",
 ];
 
+/** Chromium / WebView2 screen-share privacy controls (not in all TS libs). */
+type DisplayMediaChromiumOptions = DisplayMediaStreamOptions & {
+  selfBrowserSurface?: "include" | "exclude";
+  systemAudio?: "include" | "exclude";
+  surfaceSwitching?: "include" | "exclude";
+  monitorTypeSurfaces?: "include" | "exclude";
+  preferCurrentTab?: boolean;
+};
+
 export function pickRecorderMimeType(): string | undefined {
   if (typeof MediaRecorder === "undefined") return undefined;
   return RECORDER_MIME_CANDIDATES.find((mime) => MediaRecorder.isTypeSupported(mime));
 }
 
 async function acquireDisplayAudioStream(): Promise<MediaStream> {
-  const stream = await navigator.mediaDevices.getDisplayMedia({
-    // Video must stay enabled (do not stop the track) or system/tab audio often ends on Windows.
-    video: { width: 1, height: 1, frameRate: 1 },
+  const options: DisplayMediaChromiumOptions = {
+    // Tiny video track keeps tab/system audio alive on Windows; audio is what we use.
+    video: {
+      width: 1,
+      height: 1,
+      frameRate: 1,
+      displaySurface: "browser",
+    },
     audio: {
       echoCancellation: false,
       noiseSuppression: false,
       autoGainControl: false,
-    },
-  });
+    } as MediaTrackConstraints,
+    // Do not offer this assistant app (localhost / Tauri) — avoids sharing our own UI + indicator.
+    selfBrowserSurface: "exclude",
+    preferCurrentTab: false,
+    // Prefer tab/window capture; full-screen share shows a heavier OS indicator.
+    monitorTypeSurfaces: "exclude",
+    surfaceSwitching: "exclude",
+    // Tab/window panes still offer "Share tab audio" / "Share system audio" where supported.
+    systemAudio: "include",
+  };
+
+  const stream = await navigator.mediaDevices.getDisplayMedia(options);
 
   if (stream.getAudioTracks().length === 0) {
     for (const track of stream.getTracks()) track.stop();
     throw new Error(
-      "No audio track in screen share. Enable “Share system audio” or “Share tab audio”, then try again.",
+      "No audio in this share. Pick your interview tab or window and enable “Share tab audio” or “Also share system audio”.",
     );
   }
 

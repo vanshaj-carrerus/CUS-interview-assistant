@@ -33,12 +33,12 @@ function captureModeLabel(
   if (phase === "picking") {
     return source === "microphone"
       ? "Allow microphone access…"
-      : "Pick interview tab — enable Share audio (once)";
+      : "Select interview tab (Share audio) — once per session";
   }
   if (phase === "listening") {
     return source === "microphone"
       ? "Groq Whisper · microphone"
-      : "Groq Whisper · tab/system audio";
+      : "Groq Whisper · tab audio";
   }
   return source === "microphone" ? "Microphone ready" : "Tab audio connected";
 }
@@ -61,6 +61,10 @@ export function useCloudStt({ getEditorBridge, onCaptureActive, onError }: UseCl
   const promptContextRef = useRef("");
   const queueRef = useRef<Promise<void>>(Promise.resolve());
   const abortRef = useRef(false);
+  /** One in-flight getDisplayMedia; prevents 3–4 stacked picker dialogs. */
+  const captureInflightRef = useRef<Promise<void> | null>(null);
+  /** Session succeeded once — skip re-prompt until release or track ends. */
+  const captureEstablishedRef = useRef(false);
 
   const stopRecorder = useCallback(() => {
     chunkedRecorderRef.current?.stop();
@@ -89,22 +93,14 @@ export function useCloudStt({ getEditorBridge, onCaptureActive, onError }: UseCl
     apiKeyRef.current = null;
     promptContextRef.current = "";
     queueRef.current = Promise.resolve();
+    captureInflightRef.current = null;
+    captureEstablishedRef.current = false;
     setIsAudioReady(false);
     setCaptureMode("Idle");
   }, [stopRecorder]);
 
   const ensureAudioCapture = useCallback(async () => {
-    await ensureSttKeyLoaded();
-    const apiKey = groqApiKey();
-    if (!apiKey) {
-      const message =
-        "Missing Groq API key. Run: npm run env:sync or set VITE_GROQ_API_KEY in src-tauri/.env.";
-      onError?.(message);
-      throw new Error(message);
-    }
-    apiKeyRef.current = apiKey;
-
-    if (isStreamAlive(streamRef.current)) {
+    if (captureEstablishedRef.current && isStreamAlive(streamRef.current)) {
       setIsAudioReady(true);
       const source = sttAudioSource();
       if (!listeningRef.current) {
@@ -113,42 +109,80 @@ export function useCloudStt({ getEditorBridge, onCaptureActive, onError }: UseCl
       return;
     }
 
-    if (streamRef.current) {
-      stopMediaStream(streamRef.current);
-      streamRef.current = null;
-      setIsAudioReady(false);
+    if (captureInflightRef.current) {
+      await captureInflightRef.current;
+      return;
     }
 
-    const source = sttAudioSource();
-    setCaptureMode(captureModeLabel(source, "picking"));
+    const run = async () => {
+      await ensureSttKeyLoaded();
+      const apiKey = groqApiKey();
+      if (!apiKey) {
+        const message =
+          "Missing Groq API key. Run: npm run env:sync or set VITE_GROQ_API_KEY in src-tauri/.env.";
+        onError?.(message);
+        throw new Error(message);
+      }
+      apiKeyRef.current = apiKey;
 
-    try {
-      const stream = await acquireSttAudioStream(source);
-      streamRef.current = stream;
-
-      for (const track of stream.getAudioTracks()) {
-        track.onended = () => {
-          setIsAudioReady(false);
-          stopRecorderRef.current();
-          stopMediaStream(streamRef.current);
-          streamRef.current = null;
-          setCaptureMode("Idle");
-          onError?.(
-            "Audio capture ended. Open the app again or click Listen to reconnect.",
-          );
-        };
+      if (isStreamAlive(streamRef.current)) {
+        captureEstablishedRef.current = true;
+        setIsAudioReady(true);
+        const source = sttAudioSource();
+        if (!listeningRef.current) {
+          setCaptureMode(captureModeLabel(source, "ready"));
+        }
+        return;
       }
 
-      setIsAudioReady(true);
-      setCaptureMode(captureModeLabel(source, "ready"));
-    } catch (err) {
-      const message =
-        err instanceof Error ? err.message : "Could not access audio for transcription.";
-      onError?.(message);
-      setCaptureMode("Idle");
-      throw err;
+      if (streamRef.current) {
+        stopMediaStream(streamRef.current);
+        streamRef.current = null;
+        captureEstablishedRef.current = false;
+        setIsAudioReady(false);
+      }
+
+      const source = sttAudioSource();
+      setCaptureMode(captureModeLabel(source, "picking"));
+
+      try {
+        const stream = await acquireSttAudioStream(source);
+        streamRef.current = stream;
+        captureEstablishedRef.current = true;
+
+        for (const track of stream.getAudioTracks()) {
+          track.onended = () => {
+            captureEstablishedRef.current = false;
+            setIsAudioReady(false);
+            stopRecorderRef.current();
+            stopMediaStream(streamRef.current);
+            streamRef.current = null;
+            setCaptureMode("Idle");
+            onError?.(
+              "Audio share ended. Click Listen once to reconnect (one picker).",
+            );
+          };
+        }
+
+        setIsAudioReady(true);
+        setCaptureMode(captureModeLabel(source, "ready"));
+      } catch (err) {
+        captureEstablishedRef.current = false;
+        const message =
+          err instanceof Error ? err.message : "Could not access audio for transcription.";
+        onError?.(message);
+        setCaptureMode("Idle");
+        throw err;
+      }
+    };
+
+    captureInflightRef.current = run();
+    try {
+      await captureInflightRef.current;
+    } finally {
+      captureInflightRef.current = null;
     }
-  }, [onError, stopRecorder]);
+  }, [onError]);
 
   const enqueueChunk = useCallback(
     (blob: Blob) => {
@@ -196,7 +230,7 @@ export function useCloudStt({ getEditorBridge, onCaptureActive, onError }: UseCl
   const startListening = useCallback(async () => {
     if (listeningRef.current) return;
 
-    if (!isStreamAlive(streamRef.current)) {
+    if (!captureEstablishedRef.current || !isStreamAlive(streamRef.current)) {
       await ensureAudioCapture();
     }
 

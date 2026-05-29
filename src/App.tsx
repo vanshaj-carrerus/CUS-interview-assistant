@@ -131,6 +131,12 @@ function App() {
     getEditorBridge,
     onError: (message) => setErrorMessage(message),
   });
+  const ensureAudioCaptureRef = useRef(ensureAudioCapture);
+  ensureAudioCaptureRef.current = ensureAudioCapture;
+  const releaseAudioCaptureRef = useRef(releaseAudioCapture);
+  releaseAudioCaptureRef.current = releaseAudioCapture;
+  /** One picker per login — survives React Strict Mode remounts in dev. */
+  const audioSetupTokenRef = useRef<string | null>(null);
   const isListeningRef = useRef(isListening);
   const isSendingRef = useRef(isSending);
   const sendToAiRef = useRef<(options?: SendToAiOptions) => Promise<void>>(async () => {});
@@ -244,21 +250,23 @@ function App() {
     }
   }, [latestUpdateVersion, isUpdating]);
 
-  /** One-time screen/tab audio picker after sign-in (stream stays open until app closes). */
+  /** One-time screen/tab audio picker after sign-in (stream stays open until sign-out). */
   useEffect(() => {
-    if (!isTauriRuntime() || !authSession) return;
+    if (!isTauriRuntime() || !authSession?.token) return;
+    if (audioSetupTokenRef.current === authSession.token) return;
+    audioSetupTokenRef.current = authSession.token;
     setErrorMessage("");
-    void ensureAudioCapture().catch(() => {
+    void ensureAudioCaptureRef.current().catch(() => {
       // Error surfaced via onError from the hook.
     });
-  }, [authSession?.token, ensureAudioCapture]);
+  }, [authSession?.token]);
 
   useEffect(() => {
     if (!isTauriRuntime()) return;
-    return () => {
-      releaseAudioCapture();
-    };
-  }, [releaseAudioCapture]);
+    const onPageHide = () => releaseAudioCaptureRef.current();
+    window.addEventListener("pagehide", onPageHide);
+    return () => window.removeEventListener("pagehide", onPageHide);
+  }, []);
 
   useEffect(() => {
     const node = scrollRef.current;
@@ -492,6 +500,7 @@ function App() {
   const handleSignOut = useCallback(async () => {
     await stopListening();
     releaseAudioCapture();
+    audioSetupTokenRef.current = null;
     await logoutRemote();
     setAuthSession(null);
     setChatMessages([]);
@@ -931,9 +940,9 @@ function EmptyState({ aiAllowed }: { aiAllowed: boolean }) {
           <span className="rounded bg-white/5 px-1.5 py-0.5 text-slate-200">
             Listen
           </span>{" "}
-          to transcribe Hindi/English (Hinglish) speech with Groq Whisper. On first
-          open you pick your interview tab once with Share audio — then Listen
-          toggles transcription only. Or type or paste the recruiter question. When you are ready,
+          to transcribe Hindi/English (Hinglish) speech. After sign-in, pick your
+          interview tab once (not this app) with Share audio enabled — then Listen
+          only toggles transcription. Or type or paste the recruiter question. When you are ready,
           use{" "}
           <span className="rounded bg-white/5 px-1.5 py-0.5 text-slate-200">
             Send to AI
