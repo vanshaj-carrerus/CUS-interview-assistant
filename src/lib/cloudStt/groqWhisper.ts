@@ -1,3 +1,5 @@
+import { buildWhisperPrompt, sttLanguage } from "../sttConfig";
+
 const GROQ_TRANSCRIPTIONS_URL = "https://api.groq.com/openai/v1/audio/transcriptions";
 const GROQ_WHISPER_MODEL = "whisper-large-v3-turbo";
 
@@ -11,7 +13,7 @@ function extensionForBlob(blob: Blob): string {
 export async function transcribeAudioBlob(
   blob: Blob,
   apiKey: string,
-  prompt?: string,
+  rollingContext?: string,
 ): Promise<string> {
   if (blob.size < 1200) return "";
 
@@ -20,14 +22,12 @@ export async function transcribeAudioBlob(
   const form = new FormData();
   form.append("file", new File([blob], `chunk.${ext}`, { type: mime }));
   form.append("model", GROQ_WHISPER_MODEL);
-  form.append("language", "en");
+  form.append("language", sttLanguage());
   form.append("response_format", "json");
   form.append("temperature", "0");
 
-  const trimmedPrompt = prompt?.trim();
-  if (trimmedPrompt) {
-    form.append("prompt", trimmedPrompt.slice(-500));
-  }
+  const prompt = buildWhisperPrompt(rollingContext);
+  if (prompt) form.append("prompt", prompt);
 
   const response = await fetch(GROQ_TRANSCRIPTIONS_URL, {
     method: "POST",

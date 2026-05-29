@@ -27,7 +27,6 @@ import {
   type TranscriptEditorHandle,
 } from "./components/TranscriptEditor";
 import { useCloudStt } from "./hooks/useCloudStt";
-import { ensureSttKeyLoaded } from "./lib/sttConfig";
 import {
   buildInterviewCoachPrompt,
   buildRefineCoachPrompt,
@@ -124,8 +123,10 @@ function App() {
   const {
     isListening,
     captureMode,
+    ensureAudioCapture,
     startListening,
     stopListening,
+    releaseAudioCapture,
   } = useCloudStt({
     getEditorBridge,
     onError: (message) => setErrorMessage(message),
@@ -243,13 +244,21 @@ function App() {
     }
   }, [latestUpdateVersion, isUpdating]);
 
+  /** One-time screen/tab audio picker after sign-in (stream stays open until app closes). */
+  useEffect(() => {
+    if (!isTauriRuntime() || !authSession) return;
+    setErrorMessage("");
+    void ensureAudioCapture().catch(() => {
+      // Error surfaced via onError from the hook.
+    });
+  }, [authSession?.token, ensureAudioCapture]);
+
   useEffect(() => {
     if (!isTauriRuntime()) return;
-    void ensureSttKeyLoaded();
     return () => {
-      void stopListening();
+      releaseAudioCapture();
     };
-  }, [stopListening]);
+  }, [releaseAudioCapture]);
 
   useEffect(() => {
     const node = scrollRef.current;
@@ -481,12 +490,14 @@ function App() {
   );
 
   const handleSignOut = useCallback(async () => {
+    await stopListening();
+    releaseAudioCapture();
     await logoutRemote();
     setAuthSession(null);
     setChatMessages([]);
     transcriptEditorRef.current?.clear();
     setErrorMessage("");
-  }, []);
+  }, [releaseAudioCapture, stopListening]);
   const lastAssistantIndex = findLastAssistantIndex(chatMessages);
   const lastCoachTurn = getLastCoachTurn(chatMessages);
   const canRegenerate = !!lastCoachTurn && !isSending;
@@ -920,8 +931,9 @@ function EmptyState({ aiAllowed }: { aiAllowed: boolean }) {
           <span className="rounded bg-white/5 px-1.5 py-0.5 text-slate-200">
             Listen
           </span>{" "}
-          to transcribe speech with Groq Whisper (share your interview tab with
-          audio, or use microphone mode), or type or paste the recruiter question. When you are ready,
+          to transcribe Hindi/English (Hinglish) speech with Groq Whisper. On first
+          open you pick your interview tab once with Share audio — then Listen
+          toggles transcription only. Or type or paste the recruiter question. When you are ready,
           use{" "}
           <span className="rounded bg-white/5 px-1.5 py-0.5 text-slate-200">
             Send to AI
